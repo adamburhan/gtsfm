@@ -108,6 +108,16 @@ cluster_optimizer:
       calibration_prior_focal_sigma: 20.0
       measurement_noise_sigma: 1.0
 
+      # Unimodal depth factor (opt-in; baseline BA is unchanged when disabled).
+      use_depth_factor: False
+      depth_factor_sigma: 0.1
+      depth_factor_robust_loss: False
+      depth_map_dir: null
+      depth_min: 0.1
+      depth_max: 20.0
+      depth_scale: 1.0
+      depth_filename_template: "depth{:06d}.png"
+
   # comment out to not run
   dense_multiview_optimizer:
     _target_: gtsfm.densify.mvs_patchmatchnet.MVSPatchmatchNet

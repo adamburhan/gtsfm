@@ -22,7 +22,7 @@ def add_loader_args(parser: ArgumentParser) -> None:
         default=None,
         help=(
             "Loader type. Available options include: argoverse, astrovision, colmap, "
-            "hilti, mobilebrick, olsson, one_d_sfm, "
+            "hilti, mobilebrick, olsson, one_d_sfm, replica, "
             "tanks_and_temples, yfcc_imb. Falls back to config when omitted."
         ),
     )

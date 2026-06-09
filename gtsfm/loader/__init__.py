@@ -12,6 +12,7 @@ __all__ = [
     "Mobilebrick",
     "Olsson",
     "OneDSFM",
+    "Replica",
     "TanksAndTemples",
     "YfccImb",
 ]
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from .mobilebrick_loader import MobilebrickLoader as Mobilebrick
     from .olsson_loader import OlssonLoader as Olsson
     from .one_d_sfm_loader import OneDSFMLoader as OneDSFM
+    from .replica_loader import ReplicaLoader as Replica
     from .tanks_and_temples_loader import TanksAndTemplesLoader as TanksAndTemples
     from .yfcc_imb_loader import YfccImbLoader as YfccImb
 
@@ -37,6 +39,7 @@ _MOD_MAP = {
     "Mobilebrick": ("gtsfm.loader.mobilebrick_loader", "MobilebrickLoader"),
     "Olsson": ("gtsfm.loader.olsson_loader", "OlssonLoader"),
     "OneDSFM": ("gtsfm.loader.one_d_sfm_loader", "OneDSFMLoader"),
+    "Replica": ("gtsfm.loader.replica_loader", "ReplicaLoader"),
     "TanksAndTemples": ("gtsfm.loader.tanks_and_temples_loader", "TanksAndTemplesLoader"),
     "YfccImb": ("gtsfm.loader.yfcc_imb_loader", "YfccImbLoader"),
 }

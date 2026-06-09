@@ -1,0 +1,9 @@
+# Replica Loader Configuration
+_target_: gtsfm.loader.Replica
+dataset_dir: ??? # Required - Replica root containing cam_params.json and sequence dirs
+sequence: office0 # Sequence name (e.g. office0, room0)
+stride: 1
+max_frames: null # Optional cap on number of frames (after striding)
+max_resolution: 760 # Keep >= 680 (Replica short side) so images match depth-map resolution
+max_frame_lookahead: null # Optional: only match pairs within this frame-index gap
+input_worker: null
