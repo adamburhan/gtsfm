@@ -262,6 +262,7 @@ class MultiViewOptimizer:
                 images,
             )
 
+        image_fnames = {idx: one_view_data_dict[idx].image_fname for idx in one_view_data_dict.keys()}
         ba_result_graph, ba_metrics_graph = self.ba_optimizer.create_computation_graph(
             ba_input_graph,
             absolute_pose_priors,
@@ -269,6 +270,7 @@ class MultiViewOptimizer:
             cameras_gt,
             save_dir=str(output_root) if output_root else None,
             tracks_2d=tracks2d_graph,
+            image_fnames=image_fnames,
         )
 
         multiview_optimizer_metrics_graph = [

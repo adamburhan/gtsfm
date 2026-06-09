@@ -24,6 +24,7 @@ import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metrics_utils
 import gtsfm.utils.tracks as track_utils
 from gtsfm.common import gtsfm_data
+from gtsfm.common.depth_provider import DepthProvider
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.common.pose_prior import PosePrior
 from gtsfm.common.sfm_track import SfmTrack2d
@@ -56,6 +57,43 @@ class RobustBAMode(Enum):
     HUBER = "HUBER"
     GMC = "GMC"
     TLS = "TLS"
+
+
+def make_depth_factor(pose_key: int, lm_key: int, d: float, noise) -> "gtsam.CustomFactor":
+    """Binary camera-frame-Z depth factor on a camera pose and a landmark.
+
+    Residual is `z_pred - d`, where `z_pred` is the Z coordinate of the landmark
+    expressed in the camera frame (planar depth, as measured by a depth sensor),
+    and `d` is the measured depth in meters. The analytic Jacobian is the third
+    row of the `transformTo` Jacobians w.r.t. the pose (1x6) and the point (1x3).
+
+    Args:
+        pose_key: GTSAM key for the camera pose variable X(i) (world-to-camera as wTc).
+        lm_key: GTSAM key for the landmark point variable P(j).
+        d: Measured depth in meters.
+        noise: 1-D noise model for the residual.
+
+    Returns:
+        A `gtsam.CustomFactor` on [pose_key, lm_key].
+    """
+
+    def error_func(this, values, H):
+        pose_wTc = values.atPose3(pose_key)
+        point_w = values.atPoint3(lm_key)
+
+        H_pose = np.zeros((3, 6), dtype=np.float64, order="F")
+        H_point = np.zeros((3, 3), dtype=np.float64, order="F")
+
+        point_c = pose_wTc.transformTo(point_w, H_pose, H_point)
+        z_pred = float(point_c[2])
+
+        if H is not None:
+            H[0] = H_pose[2:3, :]
+            H[1] = H_point[2:3, :]
+
+        return np.array([z_pred - d], dtype=np.float64)
+
+    return gtsam.CustomFactor(noise, [pose_key, lm_key], error_func)
 
 
 def multi_view_retriangulate_from_2d_tracks(
@@ -238,6 +276,20 @@ class BundleAdjustmentOptimizer:
         min_tracks_per_camera: int = 15,
         compute_pose_covariances: bool = False,
         optimizer_relative_cost_tol: float = 1e-5,
+        # ── Optional unimodal depth factor (opt-in) ──
+        # When `use_depth_factor=True` and `depth_map_dir` is set, add a 1-D
+        # camera-frame-Z depth factor per track measurement, alongside the
+        # reprojection factor. Requires per-image filenames, supplied via
+        # `image_fnames` to `create_computation_graph`. Baseline BA is unchanged
+        # when `use_depth_factor=False` (default).
+        use_depth_factor: bool = False,
+        depth_factor_sigma: float = 0.1,
+        depth_factor_robust_loss: bool = False,
+        depth_map_dir: Optional[str] = None,
+        depth_min: float = 0.1,
+        depth_max: float = 20.0,
+        depth_scale: float = 1.0,
+        depth_filename_template: Optional[str] = "depth{:06d}.png",
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -313,6 +365,18 @@ class BundleAdjustmentOptimizer:
         self._compute_pose_covariances = compute_pose_covariances
         self._optimizer_relative_cost_tol = optimizer_relative_cost_tol
 
+        # Unimodal depth factor (opt-in). See `__init__` docstring above.
+        self._use_depth_factor = use_depth_factor
+        self._depth_factor_sigma = depth_factor_sigma
+        self._depth_factor_robust_loss = depth_factor_robust_loss
+        self._depth_map_dir = depth_map_dir
+        self._depth_min = depth_min
+        self._depth_max = depth_max
+        self._depth_scale = depth_scale
+        self._depth_filename_template = depth_filename_template
+        self._image_fnames: Optional[Dict[int, str]] = None
+        self._depth_provider = None
+
         # Post-BA multi-view retriangulation (opt-in). See `__init__` docstring above.
         self._use_multi_view_retriangulation = use_multi_view_retriangulation
         self._mv_retri_min_track_length = mv_retri_min_track_length
@@ -370,6 +434,70 @@ class BundleAdjustmentOptimizer:
                     )  # type: ignore
                 )
 
+        return graph
+
+    def __get_depth_provider(self) -> Optional[DepthProvider]:
+        """Lazily build the depth provider, or None if depth factors are disabled.
+
+        Requires `use_depth_factor`, a `depth_map_dir`, and per-image filenames
+        (set via `create_computation_graph`). Returns None (and logs once) if any
+        prerequisite is missing, so depth factors are simply skipped.
+        """
+        if not self._use_depth_factor:
+            return None
+        if self._depth_provider is not None:
+            return self._depth_provider
+        if self._depth_map_dir is None or self._image_fnames is None:
+            logger.warning(
+                "use_depth_factor=True but depth_map_dir or image filenames are missing; "
+                "skipping depth factors."
+            )
+            return None
+        self._depth_provider = DepthProvider(
+            depth_map_dir=self._depth_map_dir,
+            image_fnames=self._image_fnames,
+            depth_min=self._depth_min,
+            depth_max=self._depth_max,
+            depth_scale=self._depth_scale,
+            depth_filename_template=self._depth_filename_template,
+        )
+        return self._depth_provider
+
+    def __depth_factors(self, initial_data: GtsfmData, cameras_to_model: List[int]) -> NonlinearFactorGraph:
+        """Generate camera-frame-Z depth factors for track measurements.
+
+        Mirrors `__reprojection_factors`' track/measurement gating so the depth
+        factors live on exactly the same observation edges. A measurement with no
+        depth map, or an out-of-range/invalid depth, is skipped.
+        """
+        graph = NonlinearFactorGraph()
+        depth_provider = self.__get_depth_provider()
+        if depth_provider is None:
+            return graph
+
+        depth_noise = Isotropic.Sigma(1, self._depth_factor_sigma)
+        if self._depth_factor_robust_loss:
+            depth_noise = Robust(mEstimator.Huber(self._robust_noise_basin), depth_noise)
+
+        n_added = 0
+        n_skipped = 0
+        for j in range(initial_data.number_tracks()):
+            track = initial_data.get_track(j)
+            valid_measurements = [
+                m_idx for m_idx in range(track.numberMeasurements()) if track.measurement(m_idx)[0] in cameras_to_model
+            ]
+            if len(valid_measurements) < self._min_track_length:
+                continue
+            for m_idx in valid_measurements:
+                i, uv = track.measurement(m_idx)
+                d = depth_provider.get_depth(i, float(uv[0]), float(uv[1]))
+                if d is None:
+                    n_skipped += 1
+                    continue
+                graph.push_back(make_depth_factor(X(i), P(j), d, depth_noise))
+                n_added += 1
+
+        logger.info("Depth factors: %d added, %d skipped (missing/out-of-range).", n_added, n_skipped)
         return graph
 
     def _between_factors(
@@ -488,6 +616,9 @@ class BundleAdjustmentOptimizer:
             robust_noise_basin=robust_noise_basin,
         )
         graph.push_back(reprojection_graph)
+
+        if self._use_depth_factor:
+            graph.push_back(self.__depth_factors(initial_data=initial_data, cameras_to_model=cameras_to_model))
 
         graph.push_back(
             self.__pose_priors(absolute_pose_priors=[], initial_data=initial_data, cameras_to_model=cameras_to_model)
@@ -921,6 +1052,7 @@ class BundleAdjustmentOptimizer:
         save_dir: Optional[str] = None,
         verbose: bool = True,
         tracks_2d: Optional[List["SfmTrack2d"]] = None,
+        image_fnames: Optional[Dict[int, str]] = None,
     ) -> Tuple[GtsfmData, GtsfmData, List[bool], GtsfmMetricsGroup]:
         """Runs the equivalent of `run_ba()` and `evaluate()` in a single function, to enable time profiling.
 
@@ -928,7 +1060,10 @@ class BundleAdjustmentOptimizer:
             tracks_2d: (optional) Union-find 2D track set from `CppDsfTracksEstimator.run()`.
                 Required when `use_multi_view_retriangulation` is enabled — used by
                 the post-BA retriangulation stage.
+            image_fnames: (optional) Map from image index to filename. Required when
+                `use_depth_factor` is enabled — used to locate per-image depth maps.
         """
+        self._image_fnames = image_fnames
         logger.info(
             "Input: %d tracks on %d cameras", initial_data.number_tracks(), len(initial_data.get_valid_camera_indices())
         )
@@ -1071,6 +1206,7 @@ class BundleAdjustmentOptimizer:
         cameras_gt: List[Optional[gtsfm_types.CAMERA_TYPE]],
         save_dir: Optional[str] = None,
         tracks_2d: Optional[Delayed] = None,
+        image_fnames: Optional[Dict[int, str]] = None,
     ) -> Tuple[Delayed, Delayed]:
         """Create the computation graph for performing bundle adjustment.
 
@@ -1082,6 +1218,8 @@ class BundleAdjustmentOptimizer:
             save_dir: Directory where artifacts and plots should be saved to disk.
             tracks_2d: (optional) Delayed list of 2D tracks from `CppDsfTracksEstimator`.
                 Required when `use_multi_view_retriangulation` is enabled.
+            image_fnames: (optional) Map from image index to filename. Required when
+                `use_depth_factor` is enabled — used to locate per-image depth maps.
 
         Returns:
             GtsfmData aligned to GT (if provided), wrapped up using dask.delayed
@@ -1095,5 +1233,6 @@ class BundleAdjustmentOptimizer:
             cameras_gt,
             save_dir=save_dir,
             tracks_2d=tracks_2d,
+            image_fnames=image_fnames,
         )
         return filtered_sfm_data, metrics_graph
