@@ -202,7 +202,11 @@ class SceneOptimizer:
             config_path = base_output_paths.results / "config.yaml"
             OmegaConf.save(config=config_snapshot, f=str(config_path))
             logger.info("📦 Saved final config snapshot to %s", config_path)
-        process_graph_generator.save_graph(str(base_output_paths.plots / "process_graph_output.svg"))
+        try:
+            process_graph_generator.save_graph(str(base_output_paths.plots / "process_graph_output.svg"))
+        except (OSError, FileNotFoundError) as e:
+            # pydot requires the graphviz `dot` binary, which may be absent (e.g. cluster nodes).
+            logger.warning("Skipping process-graph visualization (graphviz unavailable): %s", e)
 
         logger.info("🔥 GTSFM: Running image pair retrieval...")
         retriever_metrics, visibility_graph, similarity_matrix = self._run_retriever(client, base_output_paths)
