@@ -108,8 +108,8 @@ cluster_optimizer:
       calibration_prior_focal_sigma: 20.0
       measurement_noise_sigma: 1.0
 
-      # Unimodal depth factor (opt-in; baseline BA is unchanged when disabled).
-      use_depth_factor: False
+      # Depth factors (opt-in; baseline BA is unchanged when depth_model is "none").
+      depth_model: "none" # none | unimodal | drop_ambiguous | bimodal
       depth_factor_sigma: 0.1
       depth_factor_robust_loss: False
       depth_map_dir: null
@@ -117,6 +117,11 @@ cluster_optimizer:
       depth_max: 20.0
       depth_scale: 1.0
       depth_filename_template: "depth{:06d}.png"
+      # Ambiguity / second-hypothesis detection (used by drop_ambiguous and bimodal).
+      depth_patch_radius: 5
+      depth_gap_thresh: 0.15
+      depth_ambiguity_thresh: 0.20
+      depth_min_valid: 10
 
   # comment out to not run
   dense_multiview_optimizer:

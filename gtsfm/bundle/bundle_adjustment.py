@@ -59,6 +59,15 @@ class RobustBAMode(Enum):
     TLS = "TLS"
 
 
+class DepthFactorMode(Enum):
+    """Depth-factor variants for depth-aware bundle adjustment."""
+
+    NONE = "none"  # No depth factors (baseline BA).
+    UNIMODAL = "unimodal"  # One depth factor per measurement, single hypothesis.
+    DROP_AMBIGUOUS = "drop_ambiguous"  # Like UNIMODAL, but skip measurements near depth discontinuities.
+    BIMODAL = "bimodal"  # Max-mixture factor over (depth, depth_alt) for ambiguous measurements.
+
+
 def make_depth_factor(pose_key: int, lm_key: int, d: float, noise) -> "gtsam.CustomFactor":
     """Binary camera-frame-Z depth factor on a camera pose and a landmark.
 
@@ -92,6 +101,47 @@ def make_depth_factor(pose_key: int, lm_key: int, d: float, noise) -> "gtsam.Cus
             H[1] = H_point[2:3, :]
 
         return np.array([z_pred - d], dtype=np.float64)
+
+    return gtsam.CustomFactor(noise, [pose_key, lm_key], error_func)
+
+
+def make_bimodal_depth_factor(pose_key: int, lm_key: int, d: float, d_alt: float, noise) -> "gtsam.CustomFactor":
+    """Max-mixture variant of the depth factor, for measurements near depth discontinuities.
+
+    The residual is computed against whichever of the two depth hypotheses (`d`,
+    `d_alt`) is closer to the predicted camera-frame Z (min-|residual| mode
+    selection — the equal-weight, equal-sigma special case of max-mixtures). The
+    Jacobian is mode-independent, since both residuals share d(z_pred)/dx and
+    differ only by a constant.
+
+    Args:
+        pose_key: GTSAM key for the camera pose variable X(i) (world-to-camera as wTc).
+        lm_key: GTSAM key for the landmark point variable P(j).
+        d: Measured depth in meters (primary hypothesis, at the sampled pixel).
+        d_alt: Second depth hypothesis in meters (the other side of the discontinuity).
+        noise: 1-D noise model for the residual (shared by both modes).
+
+    Returns:
+        A `gtsam.CustomFactor` on [pose_key, lm_key].
+    """
+
+    def error_func(this, values, H):
+        pose_wTc = values.atPose3(pose_key)
+        point_w = values.atPoint3(lm_key)
+
+        H_pose = np.zeros((3, 6), dtype=np.float64, order="F")
+        H_point = np.zeros((3, 3), dtype=np.float64, order="F")
+
+        point_c = pose_wTc.transformTo(point_w, H_pose, H_point)
+        z_pred = float(point_c[2])
+        r1, r2 = z_pred - d, z_pred - d_alt
+        err = r1 if abs(r1) < abs(r2) else r2
+
+        if H is not None:
+            H[0] = H_pose[2:3, :]
+            H[1] = H_point[2:3, :]
+
+        return np.array([err], dtype=np.float64)
 
     return gtsam.CustomFactor(noise, [pose_key, lm_key], error_func)
 
@@ -276,13 +326,16 @@ class BundleAdjustmentOptimizer:
         min_tracks_per_camera: int = 15,
         compute_pose_covariances: bool = False,
         optimizer_relative_cost_tol: float = 1e-5,
-        # ── Optional unimodal depth factor (opt-in) ──
-        # When `use_depth_factor=True` and `depth_map_dir` is set, add a 1-D
+        # ── Optional depth factors (opt-in) ──
+        # When `depth_model != "none"` and `depth_map_dir` is set, add a 1-D
         # camera-frame-Z depth factor per track measurement, alongside the
         # reprojection factor. Requires per-image filenames, supplied via
         # `image_fnames` to `create_computation_graph`. Baseline BA is unchanged
-        # when `use_depth_factor=False` (default).
-        use_depth_factor: bool = False,
+        # when `depth_model="none"` (default). The `drop_ambiguous` and `bimodal`
+        # modes analyze a patch around each sample for fg/bg depth ambiguity
+        # (see `DepthProvider`), respectively skipping ambiguous measurements or
+        # giving them a two-hypothesis max-mixture factor.
+        depth_model: DepthFactorMode | str = DepthFactorMode.NONE,
         depth_factor_sigma: float = 0.1,
         depth_factor_robust_loss: bool = False,
         depth_map_dir: Optional[str] = None,
@@ -290,6 +343,10 @@ class BundleAdjustmentOptimizer:
         depth_max: float = 20.0,
         depth_scale: float = 1.0,
         depth_filename_template: Optional[str] = "depth{:06d}.png",
+        depth_patch_radius: int = 5,
+        depth_gap_thresh: float = 0.15,
+        depth_ambiguity_thresh: float = 0.20,
+        depth_min_valid: int = 10,
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -365,8 +422,11 @@ class BundleAdjustmentOptimizer:
         self._compute_pose_covariances = compute_pose_covariances
         self._optimizer_relative_cost_tol = optimizer_relative_cost_tol
 
-        # Unimodal depth factor (opt-in). See `__init__` docstring above.
-        self._use_depth_factor = use_depth_factor
+        # Depth factors (opt-in). See `__init__` docstring above.
+        if isinstance(depth_model, str):
+            self._depth_model = DepthFactorMode(depth_model)
+        else:
+            self._depth_model = depth_model
         self._depth_factor_sigma = depth_factor_sigma
         self._depth_factor_robust_loss = depth_factor_robust_loss
         self._depth_map_dir = depth_map_dir
@@ -374,6 +434,10 @@ class BundleAdjustmentOptimizer:
         self._depth_max = depth_max
         self._depth_scale = depth_scale
         self._depth_filename_template = depth_filename_template
+        self._depth_patch_radius = depth_patch_radius
+        self._depth_gap_thresh = depth_gap_thresh
+        self._depth_ambiguity_thresh = depth_ambiguity_thresh
+        self._depth_min_valid = depth_min_valid
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_provider = None
 
@@ -439,18 +503,18 @@ class BundleAdjustmentOptimizer:
     def __get_depth_provider(self) -> Optional[DepthProvider]:
         """Lazily build the depth provider, or None if depth factors are disabled.
 
-        Requires `use_depth_factor`, a `depth_map_dir`, and per-image filenames
+        Requires `depth_model != NONE`, a `depth_map_dir`, and per-image filenames
         (set via `create_computation_graph`). Returns None (and logs once) if any
         prerequisite is missing, so depth factors are simply skipped.
         """
-        if not self._use_depth_factor:
+        if self._depth_model == DepthFactorMode.NONE:
             return None
         if self._depth_provider is not None:
             return self._depth_provider
         if self._depth_map_dir is None or self._image_fnames is None:
             logger.warning(
-                "use_depth_factor=True but depth_map_dir or image filenames are missing; "
-                "skipping depth factors."
+                "depth_model=%s but depth_map_dir or image filenames are missing; skipping depth factors.",
+                self._depth_model.value,
             )
             return None
         self._depth_provider = DepthProvider(
@@ -460,6 +524,11 @@ class BundleAdjustmentOptimizer:
             depth_max=self._depth_max,
             depth_scale=self._depth_scale,
             depth_filename_template=self._depth_filename_template,
+            compute_hypotheses=self._depth_model in (DepthFactorMode.DROP_AMBIGUOUS, DepthFactorMode.BIMODAL),
+            patch_radius=self._depth_patch_radius,
+            gap_thresh=self._depth_gap_thresh,
+            ambiguity_thresh=self._depth_ambiguity_thresh,
+            min_valid=self._depth_min_valid,
         )
         return self._depth_provider
 
@@ -468,7 +537,10 @@ class BundleAdjustmentOptimizer:
 
         Mirrors `__reprojection_factors`' track/measurement gating so the depth
         factors live on exactly the same observation edges. A measurement with no
-        depth map, or an out-of-range/invalid depth, is skipped.
+        depth map, or an out-of-range/invalid depth, is skipped. Ambiguous
+        measurements (near depth discontinuities) are handled per `depth_model`:
+        dropped in DROP_AMBIGUOUS mode, given a max-mixture factor in BIMODAL
+        mode, and treated as unimodal otherwise.
         """
         graph = NonlinearFactorGraph()
         depth_provider = self.__get_depth_provider()
@@ -479,7 +551,9 @@ class BundleAdjustmentOptimizer:
         if self._depth_factor_robust_loss:
             depth_noise = Robust(mEstimator.Huber(self._robust_noise_basin), depth_noise)
 
-        n_added = 0
+        n_unimodal = 0
+        n_bimodal = 0
+        n_dropped_ambiguous = 0
         n_skipped = 0
         for j in range(initial_data.number_tracks()):
             track = initial_data.get_track(j)
@@ -490,14 +564,31 @@ class BundleAdjustmentOptimizer:
                 continue
             for m_idx in valid_measurements:
                 i, uv = track.measurement(m_idx)
-                d = depth_provider.get_depth(i, float(uv[0]), float(uv[1]))
-                if d is None:
+                sample = depth_provider.get_depth(i, float(uv[0]), float(uv[1]))
+                if sample is None:
                     n_skipped += 1
                     continue
-                graph.push_back(make_depth_factor(X(i), P(j), d, depth_noise))
-                n_added += 1
+                if sample.ambiguous and self._depth_model == DepthFactorMode.DROP_AMBIGUOUS:
+                    n_dropped_ambiguous += 1
+                    continue
+                if sample.ambiguous and self._depth_model == DepthFactorMode.BIMODAL:
+                    assert sample.depth_alt is not None
+                    graph.push_back(
+                        make_bimodal_depth_factor(X(i), P(j), sample.depth, sample.depth_alt, depth_noise)
+                    )
+                    n_bimodal += 1
+                else:
+                    graph.push_back(make_depth_factor(X(i), P(j), sample.depth, depth_noise))
+                    n_unimodal += 1
 
-        logger.info("Depth factors: %d added, %d skipped (missing/out-of-range).", n_added, n_skipped)
+        logger.info(
+            "Depth factors (%s): %d unimodal, %d bimodal, %d ambiguous dropped, %d skipped (missing/out-of-range).",
+            self._depth_model.value,
+            n_unimodal,
+            n_bimodal,
+            n_dropped_ambiguous,
+            n_skipped,
+        )
         return graph
 
     def _between_factors(
@@ -617,7 +708,7 @@ class BundleAdjustmentOptimizer:
         )
         graph.push_back(reprojection_graph)
 
-        if self._use_depth_factor:
+        if self._depth_model != DepthFactorMode.NONE:
             graph.push_back(self.__depth_factors(initial_data=initial_data, cameras_to_model=cameras_to_model))
 
         graph.push_back(
@@ -1061,7 +1152,7 @@ class BundleAdjustmentOptimizer:
                 Required when `use_multi_view_retriangulation` is enabled — used by
                 the post-BA retriangulation stage.
             image_fnames: (optional) Map from image index to filename. Required when
-                `use_depth_factor` is enabled — used to locate per-image depth maps.
+                `depth_model != "none"` — used to locate per-image depth maps.
         """
         self._image_fnames = image_fnames
         logger.info(
@@ -1219,7 +1310,7 @@ class BundleAdjustmentOptimizer:
             tracks_2d: (optional) Delayed list of 2D tracks from `CppDsfTracksEstimator`.
                 Required when `use_multi_view_retriangulation` is enabled.
             image_fnames: (optional) Map from image index to filename. Required when
-                `use_depth_factor` is enabled — used to locate per-image depth maps.
+                `depth_model != "none"` — used to locate per-image depth maps.
 
         Returns:
             GtsfmData aligned to GT (if provided), wrapped up using dask.delayed
