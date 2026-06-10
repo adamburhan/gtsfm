@@ -258,3 +258,56 @@ exclude_lines = [
     "raise NotImplementedError",
     "if __name__ == .__main__.:",
 ]
+[tool.cluv]
+# Where to store job results by default. Can be overridden per cluster.
+results_path = "$SCRATCH/logs/cluv"
+# On clusters, Cluv creates a symlink (a shortcut) in your project folder to the results_path dir.
+# This makes it easier to keep your project in $HOME and to see the results which are on $SCRATCH.
+results_symlink = "logs"
+## Where to read the data from when synchronizing data to all clusters.
+#data_source = "mila:/network/datasets/cifar10.var/cifar10_torchvision"
+## Where the dataset should be replicated on all clusters.
+#datasets_path = "$SCRATCH/datasets/cifar10"
+
+[tool.cluv.env]
+# Environment variables applied when using Slurm commands on all clusters.
+SBATCH_TIMELIMIT = "3:00:00"
+SBATCH_REQUEUE = "1"
+# Assume that compute nodes don't have internet access by default. Override below when they do.
+UV_OFFLINE="1"
+WANDB_MODE="offline"
+
+
+###  --------------   Clusters Config   --------------  ###
+
+[tool.cluv.clusters.mila]
+# Overrides specific to the Mila cluster.
+env = {UV_OFFLINE="0", WANDB_MODE="online"}
+
+[tool.cluv.clusters.tamia]
+
+[tool.cluv.clusters.killarney]
+# For example, you might not have a $SCRATCH on Killarney. This can be overwritten here.
+results_path = "$HOME/logs/cluv"
+# datasets_path = "$HOME/datasets/cifar10"
+
+[tool.cluv.clusters.vulcan]
+
+[tool.cluv.clusters.rorqual]
+env = {SBATCH_ACCOUNT="rrg-bengioy-ad"}
+
+[tool.cluv.clusters.fir]
+env = {UV_OFFLINE="0", WANDB_MODE="online", SBATCH_ACCOUNT="rrg-bengioy-ad"}
+
+[tool.cluv.clusters.nibi]
+env = {UV_OFFLINE="0", WANDB_MODE="online", SBATCH_ACCOUNT="rrg-bengioy-ad"}
+
+[tool.cluv.clusters.trillium]
+env = {SBATCH_ACCOUNT="rrg-bengioy-ad"}
+
+[tool.cluv.clusters.trillium-gpu]
+env = {SBATCH_ACCOUNT="rrg-bengioy-ad"}
+
+[tool.cluv.clusters.narval]
+# Mila doesn't have an allocation on Narval anymore.
+env = {SBATCH_ACCOUNT="def-bengioy"}
