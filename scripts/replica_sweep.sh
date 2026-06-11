@@ -48,6 +48,13 @@ uv sync
 mkdir -p $OUT
 BA=cluster_optimizer.multiview_optimizer.bundle_adjustment_module
 
+# Most worker memory is freed-but-not-returned glibc arenas ("unmanaged" in dask terms):
+# force malloc to trim so RSS tracks live allocations, and disable the pause threshold
+# (unmanaged memory never shrinks, so a paused worker deadlocks; the terminate threshold
+# still restarts it, which is cheap since two-view results are disk-cached).
+export MALLOC_TRIM_THRESHOLD_=65536
+export DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE=False
+
 echo "=== [1/3] GTSfM: seq=$SEQ depth_model=$MODE stride=$STRIDE ==="
 uv run python -m gtsfm.runner \
     --config_name unified.yaml \
