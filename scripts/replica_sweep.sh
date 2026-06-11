@@ -32,6 +32,11 @@ git clone $project_root
 cd $project_name
 git checkout --detach $GIT_COMMIT
 cp -r $project_root/.venv .venv
+# Model weights are untracked, so the clone doesn't carry them; copy from the $HOME repo
+# (SuperPoint is instantiated before the SIFT swap; NetVLAD is used for retrieval).
+for w in SuperGluePretrainedNetwork/models/weights hloc/weights; do
+    rsync -a $project_root/thirdparty/$w/ thirdparty/$w/
+done
 uv sync
 
 mkdir -p $OUT
