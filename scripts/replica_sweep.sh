@@ -53,6 +53,7 @@ BA=cluster_optimizer.multiview_optimizer.bundle_adjustment_module
 # (unmanaged memory never shrinks, so a paused worker deadlocks; the terminate threshold
 # still restarts it, which is cheap since two-view results are disk-cached).
 export MALLOC_TRIM_THRESHOLD_=65536
+export MALLOC_ARENA_MAX=2
 export DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE=False
 
 echo "=== [1/3] GTSfM: seq=$SEQ depth_model=$MODE stride=$STRIDE ==="
