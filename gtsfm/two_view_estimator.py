@@ -864,6 +864,9 @@ def create_two_view_estimator_futures(
 
     # Distribute estimator to workers once to avoid repeated large transfers.
     two_view_estimator_future = client.scatter(two_view_estimator, broadcast=True)
+    # Likewise for the GT scene mesh: embedding it directly would retain a serialized copy
+    # per task on both the scheduler and the workers (e.g. Replica: ~75MB x num_pairs).
+    gt_scene_mesh_future = client.scatter(gt_scene_mesh, broadcast=True) if gt_scene_mesh is not None else None
     logger.info("Submitting tasks directly to workers ...")
 
     # Submit tasks with image indices passed as separate parameters
@@ -879,7 +882,7 @@ def create_two_view_estimator_futures(
             i2Ti1_prior=relative_pose_priors.get((i1, i2)),
             gt_camera_i1=view1.camera_gt,
             gt_camera_i2=view2.camera_gt,
-            gt_scene_mesh=gt_scene_mesh,
+            gt_scene_mesh=gt_scene_mesh_future,
             i1=i1,
             i2=i2,
         )
