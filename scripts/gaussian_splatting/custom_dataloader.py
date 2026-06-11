@@ -145,6 +145,9 @@ class DataParser:
         scale_factor *= self.config.scale_factor
 
         poses[:, :3, 3] *= scale_factor
+        # Calibrations may be distortion-free models (e.g. Cal3_S2), which have no k1/k2.
+        k1 = float(calibrations[0].k1()) if hasattr(calibrations[0], "k1") else 0.0
+        k2 = float(calibrations[0].k2()) if hasattr(calibrations[0], "k2") else 0.0
         # print('Image Filenames:', image_filenames)
         print(
             "Calibrations:",
@@ -152,8 +155,8 @@ class DataParser:
             calibrations[0].fx(),
             calibrations[0].px(),
             calibrations[0].py(),
-            calibrations[0].k1(),
-            calibrations[0].k2(),
+            k1,
+            k2,
         )
         print("Image dims:", img_dims)
         # Intrinsics
@@ -166,8 +169,8 @@ class DataParser:
 
         distortion_params = torch.tensor(
             [
-                calibrations[0].k1(),
-                calibrations[0].k2(),
+                k1,
+                k2,
                 0.0,
                 0.0,
                 0.0,

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
+#SBATCH --mem=64G
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=ampere|lovelace|hopper
 #SBATCH --time=06:00:00
@@ -48,14 +48,6 @@ uv sync
 mkdir -p $OUT
 BA=cluster_optimizer.multiview_optimizer.bundle_adjustment_module
 
-# Most worker memory is freed-but-not-returned glibc arenas ("unmanaged" in dask terms):
-# force malloc to trim so RSS tracks live allocations, and disable the pause threshold
-# (unmanaged memory never shrinks, so a paused worker deadlocks; the terminate threshold
-# still restarts it, which is cheap since two-view results are disk-cached).
-export MALLOC_TRIM_THRESHOLD_=65536
-export MALLOC_ARENA_MAX=2
-export DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE=False
-
 echo "=== [1/3] GTSfM: seq=$SEQ depth_model=$MODE stride=$STRIDE ==="
 uv run python -m gtsfm.runner \
     --config_name unified.yaml \
@@ -64,16 +56,18 @@ uv run python -m gtsfm.runner \
     --dataset_dir $DATA \
     --max_resolution 760 \
     --output_root $OUT \
-    --worker_memory_limit 80GB \
     --dask_tmpdir $SLURM_TMPDIR \
     loader.sequence=$SEQ \
     loader.stride=$STRIDE \
     $BA.depth_model=$MODE \
-    $BA.depth_map_dir=$DATA/$SEQ/results
+    $BA.depth_map_dir=$DATA/$SEQ/results \
+    $BA.depth_scale=6553.5
 
 echo "=== [2/3] Geometry eval vs GT mesh ==="
 uv run python gtsfm/evaluation/eval_geometry_vs_mesh.py \
     --ba_dir $OUT/results/ba_output \
+    --gt_cameras_dir $OUT/results/ba_gt \
+    --gt_traj $DATA/$SEQ/traj.txt \
     --gt_ply $DATA/${SEQ}_mesh.ply \
     --out $OUT/geometry_metrics.json
 
