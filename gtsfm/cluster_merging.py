@@ -17,7 +17,8 @@ import gtsfm.common.types as gtsfm_types
 import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metrics_utils
 from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptions
-from gtsfm.cluster_optimizer.cluster_anysplat import save_splats
+
+# from gtsfm.cluster_optimizer.cluster_anysplat import save_splats  # imported lazily in _run_export_task
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
 from gtsfm.utils import align as align_utils
@@ -598,6 +599,9 @@ def compute_merging_metrics(
 def _run_export_task(payload: Tuple[Optional[Path], Future | MergedNodeResult]) -> None:
     """Persist a merged reconstruction to COLMAP text format.
 
+    Note: `save_splats` is imported lazily so that splat-free pipelines do not require the
+    vggt/AnySplat thirdparty submodules (cluster_anysplat imports them at module level).
+
     Args:
         payload: Tuple pairing the directory, and the future or result of the merged reconstruction.
     """
@@ -612,6 +616,8 @@ def _run_export_task(payload: Tuple[Optional[Path], Future | MergedNodeResult]) 
         gaussian_splats = merged_scene.get_gaussian_splats()
         if isinstance(gaussian_splats, GaussiansProtocol):
             try:
+                from gtsfm.cluster_optimizer.cluster_anysplat import save_splats
+
                 save_splats(merged_scene, merged_dir)
             except Exception as exc:
                 logger.warning("⚠️ Failed to export Gaussian splats: %s", exc)
@@ -624,6 +630,8 @@ def _run_export_task(payload: Tuple[Optional[Path], Future | MergedNodeResult]) 
             gaussian_splats = pre_ba_merged.get_gaussian_splats()
             if isinstance(gaussian_splats, GaussiansProtocol):
                 try:
+                    from gtsfm.cluster_optimizer.cluster_anysplat import save_splats
+
                     save_splats(pre_ba_merged, pre_ba_dir)
                 except Exception as exc:
                     logger.warning("⚠️ Failed to export Gaussian splats: %s", exc)
