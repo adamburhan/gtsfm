@@ -3,6 +3,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
+#SBATCH --constraint=ampere|lovelace|hopper
 #SBATCH --time=06:00:00
 
 # Replica depth-factor sweep: one (sequence, depth_model) per job.
@@ -14,6 +15,11 @@
 #   e.g. cluv submit mila scripts/replica_sweep.sh -- office0 bimodal
 
 set -eo pipefail
+
+# torch 2.7+cu128 wheels have no sm_70 kernels (hence the ampere+ constraint above);
+# cuda module provides nvcc for gsplat's JIT compilation (newest available, minor
+# mismatch vs torch's bundled 12.8 runtime is fine).
+module load cuda/12.6.0
 
 SEQ=${1:?usage: replica_sweep.sh <sequence> <depth_model> [stride] [gs_max_steps]}
 MODE=${2:?depth_model: none | unimodal | drop_ambiguous | bimodal}
