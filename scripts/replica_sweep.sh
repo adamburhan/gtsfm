@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=128G
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=ampere|lovelace|hopper
 #SBATCH --time=06:00:00
@@ -56,6 +56,8 @@ uv run python -m gtsfm.runner \
     --dataset_dir $DATA \
     --max_resolution 760 \
     --output_root $OUT \
+    --worker_memory_limit 80GB \
+    --dask_tmpdir $SLURM_TMPDIR \
     loader.sequence=$SEQ \
     loader.stride=$STRIDE \
     $BA.depth_model=$MODE \
