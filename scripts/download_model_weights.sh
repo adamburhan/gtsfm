@@ -48,8 +48,8 @@ NETVLAD_CKPT_URL="https://github.com/johnwlambert/gtsfm-datasets-mirror/releases
 mkdir $NETVLAD_WEIGHTS_DIR
 wget $NETVLAD_CKPT_URL -O $NETVLAD_WEIGHTS_DIR/VGG16-NetVLAD-Pitts30K.mat
 
-##################### vggt #############################
-VGGT_WEIGHTS_DIR="./thirdparty/vggt/weights"
-VGGT_CKPT_URL="https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-mkdir $VGGT_WEIGHTS_DIR
-wget $VGGT_CKPT_URL -O $VGGT_WEIGHTS_DIR/model.pt
+# ##################### vggt #############################
+# VGGT_WEIGHTS_DIR="./thirdparty/vggt/weights"
+# VGGT_CKPT_URL="https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+# mkdir $VGGT_WEIGHTS_DIR
+# wget $VGGT_CKPT_URL -O $VGGT_WEIGHTS_DIR/model.pt

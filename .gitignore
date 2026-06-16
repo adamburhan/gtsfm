@@ -191,7 +191,7 @@ cache/
 *.mat
 
 # Dev notebooks
-notebooks/
+#notebooks/
 
 # Secret files
 .env

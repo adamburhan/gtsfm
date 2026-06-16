@@ -28,17 +28,15 @@ keywords = ["computer-vision", "structure-from-motion", "sfm", "3d-reconstructio
 dependencies = [
     # Python essentials
     "python-dotenv",
-    
     # Dask and related (for parallel computation)
     "asyncssh",
     "dask==2025.9.1",
     "distributed==2025.9.1",
     "lz4==4.4.4",
     "msgpack==1.1.1",  # Note: msgpack-python in conda, msgpack in PyPI
-    "bokeh", 
+    "bokeh",
     "toolz==1.1.0",
     "tornado==6.5.2",
-    
     # Core functionality and APIs
     "hydra-core",
     "matplotlib>=3.5",
@@ -50,11 +48,9 @@ dependencies = [
     "scikit-learn",
     "scipy",
     "seaborn",
-    
     # 3rd party algorithms for different modules
     "kornia>=0.7.3",
     "pycolmap==3.11.1",
-    
     # IO
     "h5py",
     "plotly>=5.0",
@@ -62,15 +58,12 @@ dependencies = [
     "simplejson",
     "pyparsing>=3.0.9",
     "psycopg2-binary",  # Note: psycopg2 in conda, psycopg2-binary in PyPI (easier to install)
-    
     # Testing
     "parameterized",
     "wget",
-    
     # PyTorch (sources configured below for GPU/CPU selection)
     "torch>=2.5.0,<2.8.0",
     "torchvision>=0.20.0,<0.23.0",
-    
     # Computer vision
     "opencv-python>=4.5.4.60",
     "pydegensac",
@@ -78,7 +71,6 @@ dependencies = [
     "trimesh[easy]",
     "gtsam-develop==4.3a1.dev202604240153",
     "pydot",
-    
     # Dust3r/Mast3r
     "roma",
     "tqdm",
@@ -86,13 +78,11 @@ dependencies = [
     "tensorboard",
     "pyglet<2",
     "huggingface-hub[torch]==0.34.4",
-    
     # 3D Gaussian Splatting
     "gsplat==1.5.3",
     "torchmetrics==1.7.3",
     "tyro==0.9.24",
     "Flask>=3.0,<4.0",
-    
     # AnySplat
     "dacite",
     "lightning",
@@ -105,6 +95,8 @@ dependencies = [
     "visu3d==1.5.3",
     "etils==1.7.0",
     "nbformat==5.10.4",
+    "jupyterlab>=4.5.8",
+    "ipykernel>=7.3.0",
 ]
 
 # ============================================================================
