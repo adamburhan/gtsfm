@@ -13,7 +13,7 @@ from PIL import Image as PILImage
 
 import gtsfm.common.types as gtsfm_types
 import gtsfm.utils.metrics as metrics_utils
-from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptions
+from gtsfm.bundle.bundle_adjustment import BundleAdjustmentOptions, DepthFactorMode
 from gtsfm.cluster_optimizer.cluster_optimizer_base import ClusterComputationGraph, ClusterContext, ClusterOptimizerBase
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.evaluation.metrics import GtsfmMetric, GtsfmMetricsGroup
@@ -50,6 +50,8 @@ def _run_cluster_ba(
     drop_camera_with_no_track: bool = False,
     min_track_length: int = 2,
     cluster_label: Optional[str] = None,
+    depth_arrays: Optional[dict[int, np.ndarray]] = None,
+    image_fnames: Optional[dict[int, str]] = None,
 ) -> tuple[GtsfmData, GtsfmData]:
     """Run cluster-level BA on a GtsfmData result.
 
@@ -84,6 +86,9 @@ def _run_cluster_ba(
 
     try:
         optimizer = ba_options.to_optimizer(min_track_length=min_track_length)
+        # Inject depth source for opt-in depth factors (no-op when depth_model="none").
+        optimizer._depth_arrays = depth_arrays
+        optimizer._image_fnames = image_fnames
         gtsfm_data_with_ba, _ = optimizer.run_simple_ba(gtsfm_data)
 
         gtsfm_data_with_ba = gtsfm_data_with_ba.filter_landmark_measurements(
@@ -186,10 +191,21 @@ def _run_vggt_pipeline(
     loader_kwargs: dict[str, Any] | None = None,
     weights_path: Any = None,
     cluster_label: Optional[str] = None,
-) -> GtsfmData:
+    extract_depth: bool = False,
+) -> tuple[GtsfmData, Optional[dict[int, np.ndarray]]]:
     """Run VGGT geometry prediction + tracking -> GtsfmData (no BA).
 
     This is a module-level function for use with ``dask.delayed``.
+
+    When ``extract_depth`` is set, VGGT's per-image depth maps are copied to host
+    memory (before ``geo_output`` is released) and returned as a dict keyed by
+    global camera index, for use as in-memory depth factors in cluster BA. The
+    maps are realigned to the track pixel space (the crop offset that
+    ``build_gtsfm_data`` adds back to track ``uv`` is reapplied here), so a depth
+    sample at a track ``(u, v)`` indexes the returned array directly.
+
+    Returns:
+        Tuple of (GtsfmData, depth_arrays or None).
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -240,11 +256,26 @@ def _run_vggt_pipeline(
         cluster_label=cluster_label,
     )
 
+    # Step 5: Optionally copy VGGT depth maps to host for in-memory depth factors.
+    depth_arrays: Optional[dict[int, np.ndarray]] = None
+    if extract_depth:
+        depth_np = geo_output.depth_map.detach().to(torch.float32).cpu().numpy()  # (N, H, W)
+        coords_np = original_coords.detach().to(torch.float32).cpu().numpy()  # (N, 6)
+        depth_arrays = {}
+        for k, cam_idx in enumerate(image_indices):
+            d = depth_np[k]
+            # build_gtsfm_data adds the crop's top offset back to track v; reapply it
+            # here so the array indexes match track uv. crop_top is 0 when uncropped.
+            crop_top = int(round(coords_np[k, 1]))
+            if crop_top > 0:
+                d = np.pad(d, ((crop_top, 0), (0, 0)), constant_values=np.nan)
+            depth_arrays[int(cam_idx)] = d
+
     if geo_output.device.type == "cuda":
         del geo_output
         torch.cuda.empty_cache()
 
-    return gtsfm_data
+    return gtsfm_data, depth_arrays
 
 
 def _save_reconstruction_as_text(
@@ -469,7 +500,12 @@ class ClusterVGGT(ClusterOptimizerBase):
         )
 
         # 2. Run VGGT pipeline (geometry + tracking -> GtsfmData, NO BA).
-        pre_ba_data_graph = delayed(_run_vggt_pipeline)(
+        # Only extract VGGT depth when depth factors are actually enabled.
+        depth_model = self.ba_options.depth_model
+        if isinstance(depth_model, str):
+            depth_model = DepthFactorMode(depth_model)
+        extract_depth = depth_model != DepthFactorMode.NONE
+        pre_ba_data_graph, depth_arrays_graph = delayed(_run_vggt_pipeline, nout=2)(
             image_batch_graph,
             original_coords_graph,
             transformer=self.geometry_transformer,
@@ -482,12 +518,17 @@ class ClusterVGGT(ClusterOptimizerBase):
             loader_kwargs=self._loader_kwargs or None,
             weights_path=self._weights_path,
             cluster_label=context.label,
+            extract_depth=extract_depth,
         )
 
-        # 3. Run cluster-level BA.
+        # 3. Run cluster-level BA. Pass the in-memory VGGT depth (keyed by global
+        # camera index) so opt-in depth factors fire without any on-disk maps.
+        image_fnames = {idx: name for idx, name in zip(global_indices, image_names)}
         ba_result_graph, pre_ba_result_graph = delayed(_run_cluster_ba, nout=2)(
             pre_ba_data_graph,
             ba_options=self.ba_options,
+            depth_arrays=depth_arrays_graph,
+            image_fnames=image_fnames,
             pre_ba_max_reproj_error=self._pre_ba_max_reproj_error,
             post_ba_max_reproj_error=self._post_ba_max_reproj_error,
             drop_camera_with_no_track=self._drop_camera_with_no_track,

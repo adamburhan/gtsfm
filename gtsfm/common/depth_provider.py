@@ -59,9 +59,10 @@ class DepthProvider:
 
     def __init__(
         self,
-        depth_map_dir: str,
-        image_fnames: Dict[int, str],
+        depth_map_dir: Optional[str] = None,
+        image_fnames: Optional[Dict[int, str]] = None,
         *,
+        depth_arrays: Optional[Dict[int, np.ndarray]] = None,
         depth_min: float,
         depth_max: float,
         depth_scale: float = 1.0,
@@ -75,8 +76,17 @@ class DepthProvider:
     ) -> None:
         """
         Args:
-            depth_map_dir: Directory containing the per-image depth maps.
-            image_fnames: Map from GTSfM image index to image filename.
+            depth_map_dir: Directory containing the per-image depth maps. Unused
+                (and may be None) when `depth_arrays` is supplied.
+            image_fnames: Map from GTSfM image index to image filename. Unused
+                (and may be None) when `depth_arrays` is supplied.
+            depth_arrays: Optional in-memory depth maps keyed by GTSfM image index
+                (camera-frame planar Z, already in the reconstruction's units).
+                When given, depth is read from here instead of disk, keyed
+                directly by image index, so no filename/template resolution and no
+                `depth_scale` division are applied. Used for transformer-predicted
+                depth (e.g. VGGT), which is produced in memory at cluster-local
+                scale.
             depth_min: Minimum valid depth in meters; samples below are dropped.
             depth_max: Maximum valid depth in meters; samples above are dropped.
             depth_scale: Divisor applied to raw depth values to recover meters
@@ -100,7 +110,8 @@ class DepthProvider:
             min_valid: Minimum number of valid depths in the patch to attempt the
                 analysis.
         """
-        self._dir = Path(depth_map_dir)
+        self._arrays = depth_arrays
+        self._dir = Path(depth_map_dir) if depth_map_dir is not None else None
         self._fnames = image_fnames
         self._depth_min = depth_min
         self._depth_max = depth_max
@@ -125,6 +136,10 @@ class DepthProvider:
 
     def _depth_map(self, image_id: int) -> Optional[np.ndarray]:
         """Lazily load and cache the (native-resolution) depth map in meters."""
+        if self._arrays is not None:
+            # In-memory depth (e.g. VGGT): keyed directly by image index, already
+            # in the reconstruction's units (no filename resolution, no scaling).
+            return self._arrays.get(image_id)
         if image_id not in self._cache:
             path = self._dir / self._depth_filename(image_id)
             if not path.exists():

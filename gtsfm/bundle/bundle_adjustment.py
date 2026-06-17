@@ -257,6 +257,21 @@ class BundleAdjustmentOptions:
     min_tracks_per_camera: int = 15
     compute_pose_covariances: bool = False
     optimizer_relative_cost_tol: float = 1e-5
+    # Depth factors (opt-in; baseline BA is unchanged when depth_model is "none").
+    # For on-disk depth (e.g. GT), set depth_map_dir; for transformer-predicted
+    # depth (e.g. VGGT), depth arrays are injected at runtime instead.
+    depth_model: Union[DepthFactorMode, str] = DepthFactorMode.NONE
+    depth_factor_sigma: float = 0.1
+    depth_factor_robust_loss: bool = False
+    depth_map_dir: Optional[str] = None
+    depth_min: float = 0.1
+    depth_max: float = 20.0
+    depth_scale: float = 1.0
+    depth_filename_template: Optional[str] = "depth{:06d}.png"
+    depth_patch_radius: int = 5
+    depth_gap_thresh: float = 0.15
+    depth_ambiguity_thresh: float = 0.20
+    depth_min_valid: int = 10
 
     def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
         """Construct a :class:`BundleAdjustmentOptimizer` from these options.
@@ -283,6 +298,18 @@ class BundleAdjustmentOptions:
             min_tracks_per_camera=self.min_tracks_per_camera,
             compute_pose_covariances=self.compute_pose_covariances,
             optimizer_relative_cost_tol=self.optimizer_relative_cost_tol,
+            depth_model=self.depth_model,
+            depth_factor_sigma=self.depth_factor_sigma,
+            depth_factor_robust_loss=self.depth_factor_robust_loss,
+            depth_map_dir=self.depth_map_dir,
+            depth_min=self.depth_min,
+            depth_max=self.depth_max,
+            depth_scale=self.depth_scale,
+            depth_filename_template=self.depth_filename_template,
+            depth_patch_radius=self.depth_patch_radius,
+            depth_gap_thresh=self.depth_gap_thresh,
+            depth_ambiguity_thresh=self.depth_ambiguity_thresh,
+            depth_min_valid=self.depth_min_valid,
         )
         kwargs.update(overrides)
         return BundleAdjustmentOptimizer(**kwargs)
@@ -439,6 +466,7 @@ class BundleAdjustmentOptimizer:
         self._depth_ambiguity_thresh = depth_ambiguity_thresh
         self._depth_min_valid = depth_min_valid
         self._image_fnames: Optional[Dict[int, str]] = None
+        self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_provider = None
 
         # Post-BA multi-view retriangulation (opt-in). See `__init__` docstring above.
@@ -503,33 +531,50 @@ class BundleAdjustmentOptimizer:
     def __get_depth_provider(self) -> Optional[DepthProvider]:
         """Lazily build the depth provider, or None if depth factors are disabled.
 
-        Requires `depth_model != NONE`, a `depth_map_dir`, and per-image filenames
-        (set via `create_computation_graph`). Returns None (and logs once) if any
-        prerequisite is missing, so depth factors are simply skipped.
+        Requires `depth_model != NONE` plus a depth source: either in-memory
+        `depth_arrays` (transformer-predicted depth, e.g. VGGT) or a `depth_map_dir`
+        with per-image filenames (on-disk depth, e.g. GT). Both are set via
+        `create_computation_graph`. Returns None (and logs once) if neither source
+        is available, so depth factors are simply skipped.
         """
         if self._depth_model == DepthFactorMode.NONE:
             return None
         if self._depth_provider is not None:
             return self._depth_provider
-        if self._depth_map_dir is None or self._image_fnames is None:
+        compute_hypotheses = self._depth_model in (DepthFactorMode.DROP_AMBIGUOUS, DepthFactorMode.BIMODAL)
+        if self._depth_arrays is not None:
+            # In-memory depth keyed by image index; no filenames or scaling needed.
+            self._depth_provider = DepthProvider(
+                depth_arrays=self._depth_arrays,
+                depth_min=self._depth_min,
+                depth_max=self._depth_max,
+                compute_hypotheses=compute_hypotheses,
+                patch_radius=self._depth_patch_radius,
+                gap_thresh=self._depth_gap_thresh,
+                ambiguity_thresh=self._depth_ambiguity_thresh,
+                min_valid=self._depth_min_valid,
+            )
+        elif self._depth_map_dir is not None and self._image_fnames is not None:
+            self._depth_provider = DepthProvider(
+                depth_map_dir=self._depth_map_dir,
+                image_fnames=self._image_fnames,
+                depth_min=self._depth_min,
+                depth_max=self._depth_max,
+                depth_scale=self._depth_scale,
+                depth_filename_template=self._depth_filename_template,
+                compute_hypotheses=compute_hypotheses,
+                patch_radius=self._depth_patch_radius,
+                gap_thresh=self._depth_gap_thresh,
+                ambiguity_thresh=self._depth_ambiguity_thresh,
+                min_valid=self._depth_min_valid,
+            )
+        else:
             logger.warning(
-                "depth_model=%s but depth_map_dir or image filenames are missing; skipping depth factors.",
+                "depth_model=%s but no depth source (depth_arrays or depth_map_dir+filenames); "
+                "skipping depth factors.",
                 self._depth_model.value,
             )
             return None
-        self._depth_provider = DepthProvider(
-            depth_map_dir=self._depth_map_dir,
-            image_fnames=self._image_fnames,
-            depth_min=self._depth_min,
-            depth_max=self._depth_max,
-            depth_scale=self._depth_scale,
-            depth_filename_template=self._depth_filename_template,
-            compute_hypotheses=self._depth_model in (DepthFactorMode.DROP_AMBIGUOUS, DepthFactorMode.BIMODAL),
-            patch_radius=self._depth_patch_radius,
-            gap_thresh=self._depth_gap_thresh,
-            ambiguity_thresh=self._depth_ambiguity_thresh,
-            min_valid=self._depth_min_valid,
-        )
         return self._depth_provider
 
     def __depth_factors(self, initial_data: GtsfmData, cameras_to_model: List[int]) -> NonlinearFactorGraph:

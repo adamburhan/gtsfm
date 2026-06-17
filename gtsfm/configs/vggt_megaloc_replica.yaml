@@ -1,0 +1,94 @@
+# VGGT cluster-only configuration.
+
+# @package _global_
+_target_: gtsfm.scene_optimizer.SceneOptimizer
+
+loader:
+  _target_: gtsfm.loader.Replica
+  dataset_dir: ???
+  sequence: ???
+  stride: 10
+
+image_pairs_generator:
+  _target_: gtsfm.retriever.image_pairs_generator.ImagePairsGenerator
+  global_descriptor:
+    _target_: gtsfm.frontend.cacher.global_descriptor_cacher.GlobalDescriptorCacher
+    global_descriptor_obj:
+      _target_: gtsfm.frontend.global_descriptor.MegaLoc
+  retriever:
+    _target_: gtsfm.retriever.Similarity
+    num_matched: 15
+    min_score: 0.5
+  batch_size: 16
+
+graph_partitioner:
+  _target_: gtsfm.graph_partitioner.Metis
+  min_cameras_to_partition: 12
+  max_cameras: 40
+  split_oversized_nodes: true
+
+cluster_optimizer:
+  _target_: gtsfm.cluster_optimizer.Cacher
+  optimizer:
+    _target_: gtsfm.cluster_optimizer.cluster_vggt.ClusterVGGT
+
+    geometry_transformer:
+      _target_: gtsfm.frontend.vggt_geometry_transformer.VggtGeometryTransformer
+      config:
+        _target_: gtsfm.frontend.vggt_geometry_transformer.VggtGeometryConfig
+        confidence_threshold: 0.1
+        max_num_points: 100000
+        seed: 42
+
+    tracker:
+      _target_: gtsfm.frontend.multi_view_tracker.MultiViewTracker
+      config:
+        _target_: gtsfm.frontend.multi_view_tracker.TrackingConfig
+        tracking: true
+        max_query_pts: 512
+        query_frame_num: 3
+        keypoint_extractor: aliked+sp+sift
+        track_vis_thresh: 0.05
+        track_conf_thresh: 0.2
+        vggt_max_reproj_error: 14.0
+        min_triangulation_angle: 10.0
+        min_track_length: 3
+
+    pre_ba_max_reproj_error: 14.0
+    post_ba_max_reproj_error: 3.0
+    drop_camera_with_no_track: false
+    ba_options:
+      _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
+      shared_calib: true
+      use_calibration_prior: false
+      use_gnc: true
+      gnc_loss: GMC
+      factor_weight_outlier_threshold: 1e-8
+
+    # --- VGGT operational params ---
+    input_mode: crop
+    save_processed_image: true
+    weights_path: null
+    seed: 42
+    model_cache_key: null
+
+# --- Merging options ---
+merging_options:
+  _target_: gtsfm.cluster_merging.MergingOptions
+  run_bundle_adjustment: true
+  merge_duplicate_tracks: true
+  drop_child_if_merging_fail: true
+  drop_outlier_after_camera_merging: true
+  drop_camera_with_no_track: false
+  keep_all_cameras: true
+  plot_reprojection_histograms: true
+  use_nonlinear_sim3_alignment: true
+  pre_ba_max_reproj_error: 14.0
+  pre_ba_min_track_length: 2
+  post_ba_max_reproj_error: 3.0
+  min_track_length: 3
+  ba_options:
+    _target_: gtsfm.bundle.bundle_adjustment.BundleAdjustmentOptions
+    shared_calib: true
+    use_calibration_prior: true
+    use_gnc: false
