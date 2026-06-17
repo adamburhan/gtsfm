@@ -180,7 +180,7 @@ def demo_fn(args: argparse.Namespace) -> bool:
         raise ValueError(f"No images found in {image_dir}")
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
 
-    img_load_resolution = 1024
+    img_load_resolution = 518  # must be a multiple of patch size 14; 518 = 37×14 is VGGT's standard resolution
 
     images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution)
     images = images.to(device)
