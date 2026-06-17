@@ -259,7 +259,9 @@ def _run_vggt_pipeline(
     # Step 5: Optionally copy VGGT depth maps to host for in-memory depth factors.
     depth_arrays: Optional[dict[int, np.ndarray]] = None
     if extract_depth:
-        depth_np = geo_output.depth_map.detach().to(torch.float32).cpu().numpy()  # (N, H, W)
+        depth_np = geo_output.depth_map.detach().to(torch.float32).cpu().numpy()  # (N, H, W) or (N, H, W, 1)
+        if depth_np.ndim == 4 and depth_np.shape[-1] == 1:
+            depth_np = depth_np[..., 0]
         coords_np = original_coords.detach().to(torch.float32).cpu().numpy()  # (N, 6)
         depth_arrays = {}
         for k, cam_idx in enumerate(image_indices):
