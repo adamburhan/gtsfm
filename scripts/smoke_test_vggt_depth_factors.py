@@ -57,8 +57,8 @@ def main() -> None:
         image_indices=global_indices,
         image_names=image_names,
         seed=42,
-        model_cache_key=None,
-        loader_kwargs=None,
+        model_cache_key=("smoke", None),  # non-None -> model is loaded and shared with the tracker
+        loader_kwargs={},
         weights_path=None,
         cluster_label="smoke",
         extract_depth=True,
