@@ -28,14 +28,32 @@ from gtsfm.frontend.vggt_geometry_transformer import (
     load_image_batch_vggt_loader,
 )
 from gtsfm.loader.astrovision_loader import AstrovisionLoader
+from gtsfm.loader.mobilebrick_loader import MobilebrickLoader
+
+
+def _build_loader(loader_name: str, scene_dir: str):
+    """Instantiate the requested loader at VGGT's 518 resolution."""
+    if loader_name == "astrovision":
+        return AstrovisionLoader(dataset_dir=scene_dir, max_resolution=518)
+    if loader_name == "mobilebrick":
+        # Object-against-background scene -> fg/bg discontinuities -> exercises bimodal.
+        return MobilebrickLoader(dataset_dir=scene_dir, max_resolution=518)
+    raise ValueError(f"Unknown loader: {loader_name}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="VGGT depth-factor smoke test")
-    parser.add_argument("--scene_dir", required=True, help="Astrovision scene dir (with images/ + COLMAP bins).")
+    parser.add_argument("--scene_dir", required=True, help="Scene dir for the chosen loader.")
+    parser.add_argument(
+        "--loader",
+        default="astrovision",
+        choices=["astrovision", "mobilebrick"],
+        help="mobilebrick has object/background discontinuities and is more likely to produce bimodal factors.",
+    )
+    parser.add_argument("--max_query_pts", type=int, default=512, help="Lower = fewer depth factors = faster BA.")
     args = parser.parse_args()
 
-    loader = AstrovisionLoader(dataset_dir=args.scene_dir, max_resolution=518)
+    loader = _build_loader(args.loader, args.scene_dir)
     global_indices = tuple(range(len(loader)))
     image_names = tuple(loader.image_filenames())
     print(f"Loaded {len(global_indices)} images from {args.scene_dir}")
@@ -45,7 +63,9 @@ def main() -> None:
 
     transformer = VggtGeometryTransformer(VggtGeometryConfig(confidence_threshold=5.0))
     tracker = MultiViewTracker(
-        TrackingConfig(tracking=True, max_query_pts=2048, query_frame_num=3, keypoint_extractor="aliked+sp+sift")
+        TrackingConfig(
+            tracking=True, max_query_pts=args.max_query_pts, query_frame_num=3, keypoint_extractor="aliked+sp+sift"
+        )
     )
 
     # Step 1: VGGT pipeline with depth extraction (the new path).
