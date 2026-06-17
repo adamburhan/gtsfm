@@ -138,6 +138,18 @@ def main() -> None:
         help="mobilebrick/replica have depth discontinuities and are more likely to produce bimodal factors.",
     )
     parser.add_argument("--max_query_pts", type=int, default=512, help="Lower = fewer depth factors = faster BA.")
+    parser.add_argument(
+        "--ambiguity_thresh",
+        type=float,
+        default=0.20,
+        help="Binding knob for the ambiguous count (score = max_gap * balance must exceed it). Lower = more.",
+    )
+    parser.add_argument(
+        "--gap_thresh",
+        type=float,
+        default=0.15,
+        help="Only binds when > ambiguity_thresh; otherwise dominated by it (see _analyze_patch).",
+    )
     parser.add_argument("--sequence", default="office0", help="Replica sequence name (replica loader only).")
     parser.add_argument("--stride", type=int, default=20, help="Replica frame stride (replica loader only).")
     parser.add_argument("--max_frames", type=int, default=6, help="Replica max frames after striding (replica only).")
@@ -201,7 +213,8 @@ def main() -> None:
         depth_factor_sigma=0.1,
         depth_min=0.0,
         depth_max=1e9,
-        depth_gap_thresh=0.08
+        depth_gap_thresh=args.gap_thresh,
+        depth_ambiguity_thresh=args.ambiguity_thresh,
     )
 
     # Visualize which measurements get flagged ambiguous, using the SAME thresholds
