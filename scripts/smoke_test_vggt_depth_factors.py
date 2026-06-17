@@ -110,6 +110,7 @@ def main() -> None:
         depth_factor_sigma=0.1,
         depth_min=0.0,
         depth_max=1e9,
+        depth_gap_thresh=0.08
     )
     image_fnames = {idx: name for idx, name in zip(global_indices, image_names)}
 
