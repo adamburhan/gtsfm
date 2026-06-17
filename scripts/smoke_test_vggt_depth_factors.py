@@ -64,7 +64,15 @@ def main() -> None:
     transformer = VggtGeometryTransformer(VggtGeometryConfig(confidence_threshold=5.0))
     tracker = MultiViewTracker(
         TrackingConfig(
-            tracking=True, max_query_pts=args.max_query_pts, query_frame_num=3, keypoint_extractor="aliked+sp+sift"
+            tracking=True,
+            max_query_pts=args.max_query_pts,
+            query_frame_num=3,
+            keypoint_extractor="aliked+sp+sift",
+            # Mirror the production vggt configs' permissive filtering: the defaults
+            # (reproj 14px, min angle 10deg) drop all tracks on small-baseline object
+            # scans like MobileBrick.
+            vggt_max_reproj_error=0.0,
+            min_triangulation_angle=0.0,
         )
     )
 
