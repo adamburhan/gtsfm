@@ -29,31 +29,45 @@ from gtsfm.frontend.vggt_geometry_transformer import (
 )
 from gtsfm.loader.astrovision_loader import AstrovisionLoader
 from gtsfm.loader.mobilebrick_loader import MobilebrickLoader
+from gtsfm.loader.replica_loader import ReplicaLoader
 
 
-def _build_loader(loader_name: str, scene_dir: str):
+def _build_loader(args: argparse.Namespace):
     """Instantiate the requested loader at VGGT's 518 resolution."""
-    if loader_name == "astrovision":
-        return AstrovisionLoader(dataset_dir=scene_dir, max_resolution=518)
-    if loader_name == "mobilebrick":
+    if args.loader == "astrovision":
+        return AstrovisionLoader(dataset_dir=args.scene_dir, max_resolution=518)
+    if args.loader == "mobilebrick":
         # Object-against-background scene -> fg/bg discontinuities -> exercises bimodal.
-        return MobilebrickLoader(dataset_dir=scene_dir, max_resolution=518)
-    raise ValueError(f"Unknown loader: {loader_name}")
+        return MobilebrickLoader(dataset_dir=args.scene_dir, max_resolution=518)
+    if args.loader == "replica":
+        # Indoor scenes with sharp object/wall boundaries. Stride gives the few
+        # frames real baseline (consecutive 30fps frames are near-degenerate).
+        return ReplicaLoader(
+            dataset_dir=args.scene_dir,
+            sequence=args.sequence,
+            stride=args.stride,
+            max_frames=args.max_frames,
+            max_resolution=518,
+        )
+    raise ValueError(f"Unknown loader: {args.loader}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="VGGT depth-factor smoke test")
-    parser.add_argument("--scene_dir", required=True, help="Scene dir for the chosen loader.")
+    parser.add_argument("--scene_dir", required=True, help="Scene/dataset root for the chosen loader.")
     parser.add_argument(
         "--loader",
         default="astrovision",
-        choices=["astrovision", "mobilebrick"],
-        help="mobilebrick has object/background discontinuities and is more likely to produce bimodal factors.",
+        choices=["astrovision", "mobilebrick", "replica"],
+        help="mobilebrick/replica have depth discontinuities and are more likely to produce bimodal factors.",
     )
     parser.add_argument("--max_query_pts", type=int, default=512, help="Lower = fewer depth factors = faster BA.")
+    parser.add_argument("--sequence", default="office0", help="Replica sequence name (replica loader only).")
+    parser.add_argument("--stride", type=int, default=20, help="Replica frame stride (replica loader only).")
+    parser.add_argument("--max_frames", type=int, default=6, help="Replica max frames after striding (replica only).")
     args = parser.parse_args()
 
-    loader = _build_loader(args.loader, args.scene_dir)
+    loader = _build_loader(args)
     global_indices = tuple(range(len(loader)))
     image_names = tuple(loader.image_filenames())
     print(f"Loaded {len(global_indices)} images from {args.scene_dir}")
