@@ -199,8 +199,8 @@ class DepthProvider:
 
         k = int(np.argmax(gaps))
         max_gap = float(gaps[k])
-        if max_gap < self._gap_thresh:
-            return DepthSample(depth=d_center, depth_alt=None, ambiguous=False, score=0.0)
+        # if max_gap < self._gap_thresh:
+        #     return DepthSample(depth=d_center, depth_alt=None, ambiguous=False, score=0.0)
 
         split = 0.5 * (logs[k] + logs[k + 1])
         near = valid[np.log(valid) <= split]
@@ -211,7 +211,15 @@ class DepthProvider:
 
         frac_far = far.size / valid.size
         balance = 1.0 - abs(0.5 - frac_far) * 2.0
-        score = max_gap * balance
-        if score >= self._ambiguity_thresh:
-            return DepthSample(depth=d_center, depth_alt=d_alt, ambiguous=True, score=score)
-        return DepthSample(depth=d_center, depth_alt=None, ambiguous=False, score=score)
+        # score = max_gap * balance
+        # if score >= self._ambiguity_thresh:
+        #     return DepthSample(depth=d_center, depth_alt=d_alt, ambiguous=True, score=score)
+        score = max_gap 
+        min_side_count = 3
+        ambiguous = max_gap >= self._gap_thresh and min(near.size, far.size) >= min_side_count
+        return DepthSample(
+            depth=d_center, 
+            depth_alt=d_alt if ambiguous else None, 
+            ambiguous=ambiguous, 
+            score=score if ambiguous else 0.0
+        )
