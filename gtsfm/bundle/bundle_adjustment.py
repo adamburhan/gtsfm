@@ -467,7 +467,9 @@ class BundleAdjustmentOptimizer:
         self._depth_min_valid = depth_min_valid
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
+        self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
         self._depth_provider = None
+        self._depth_factor_stats = None
 
         # Post-BA multi-view retriangulation (opt-in). See `__init__` docstring above.
         self._use_multi_view_retriangulation = use_multi_view_retriangulation
@@ -634,6 +636,12 @@ class BundleAdjustmentOptimizer:
             n_dropped_ambiguous,
             n_skipped,
         )
+        self._depth_factor_stats = {
+            "unimodal": n_unimodal,
+            "bimodal": n_bimodal,
+            "dropped_ambiguous": n_dropped_ambiguous,
+            "skipped": n_skipped,
+        }
         return graph
 
     def _between_factors(
@@ -1299,6 +1307,8 @@ class BundleAdjustmentOptimizer:
             Metrics group containing metrics for both filtered and unfiltered BA results.
         """
         ba_metrics = GtsfmMetricsGroup(name=METRICS_GROUP, metrics=unfiltered_data.get_metrics(suffix="_unfiltered"))
+        for stat_name, stat_value in self._depth_factor_stats.items():
+            ba_metrics.add_metric(GtsfmMetric(name=f"num_depth_factors_{stat_name}", data=stat_value))
 
         input_image_idxs = list(unfiltered_data._image_info.keys())
         poses_gt = {

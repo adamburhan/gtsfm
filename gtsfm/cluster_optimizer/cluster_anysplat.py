@@ -379,7 +379,7 @@ class ClusterAnySplat(ClusterOptimizerBase):
             gtsfm_data.log_scene_reprojection_error_stats()
 
         if self.run_bundle_adjustment_on_leaf:
-            post_ba_gtsfm_data, _ = _run_cluster_ba(gtsfm_data, ba_options=BundleAdjustmentOptions())
+            post_ba_gtsfm_data, _, _ = _run_cluster_ba(gtsfm_data, ba_options=BundleAdjustmentOptions())
             if post_ba_gtsfm_data is not gtsfm_data:
                 for idx in post_ba_gtsfm_data.get_valid_camera_indices():
                     info = gtsfm_data.get_image_info(idx)

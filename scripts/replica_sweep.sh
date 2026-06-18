@@ -12,7 +12,7 @@
 #   3) Gaussian splatting from ba_output + NVS eval (PSNR/SSIM/LPIPS on held-out views)
 #
 # Usage: cluv submit mila scripts/replica_sweep.sh -- <sequence> <depth_model> [stride] [gs_max_steps]
-#   e.g. cluv submit mila scripts/replica_sweep.sh -- office0 bimodal
+#   e.g. cluv submit mila scripts/replica_sweep.sh -- office0 bimodal 10 7000 0.05
 
 set -eo pipefail
 
@@ -25,11 +25,12 @@ SEQ=${1:?usage: replica_sweep.sh <sequence> <depth_model> [stride] [gs_max_steps
 MODE=${2:?depth_model: none | unimodal | drop_ambiguous | bimodal}
 STRIDE=${3:-10}
 GS_STEPS=${4:-7000}
+GAPTHRESH=${5:-0.15}
 
 project_name="gtsfm"
 project_root="$HOME/repos/$project_name"
 DATA="$SCRATCH/datasets/replica/Replica"
-OUT="$SCRATCH/logs/cluv/$SLURM_JOB_ID/${SEQ}_${MODE}"
+OUT="$SCRATCH/logs/cluv/$SLURM_JOB_ID/${SEQ}_${MODE}_${GAPTHRESH}"
 
 # Pin the code at the submitted commit: the repo in $HOME may change while jobs sit in queue.
 echo "GIT_COMMIT=${GIT_COMMIT:?GIT_COMMIT is not set. Use 'cluv submit' to submit this job script.}"
@@ -61,7 +62,9 @@ uv run python -m gtsfm.runner \
     loader.stride=$STRIDE \
     $BA.depth_model=$MODE \
     $BA.depth_map_dir=$DATA/$SEQ/results \
-    $BA.depth_scale=6553.5
+    $BA.depth_scale=6553.5 \
+    $BA.depth_gap_thresh=$GAPTHRESH \
+    $BA.depth_ambiguity_thresh=0.0
 
 echo "=== [2/3] Geometry eval vs GT mesh ==="
 uv run python gtsfm/evaluation/eval_geometry_vs_mesh.py \

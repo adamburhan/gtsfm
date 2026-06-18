@@ -52,19 +52,20 @@ def _run_cluster_ba(
     cluster_label: Optional[str] = None,
     depth_arrays: Optional[dict[int, np.ndarray]] = None,
     image_fnames: Optional[dict[int, str]] = None,
-) -> tuple[GtsfmData, GtsfmData]:
+) -> tuple[GtsfmData, GtsfmData, dict[str, int]]:
     """Run cluster-level BA on a GtsfmData result.
 
     This is a module-level function so it can be used with ``dask.delayed``.
 
     Returns:
-        Tuple of (post_ba_result, pre_ba_result).
+        Tuple of (post_ba_result, pre_ba_result, depth_factor_stats).
     """
     pre_ba_data = gtsfm_data
+    depth_stats: dict[str, int] = {}
 
     if gtsfm_data.number_tracks() == 0:
         logger.warning("Skipping bundle adjustment because no valid tracks were produced.")
-        return gtsfm_data, pre_ba_data
+        return gtsfm_data, pre_ba_data, depth_stats
 
     if pre_ba_max_reproj_error > 0.0:
         num_tracks_before = gtsfm_data.number_tracks()
@@ -82,7 +83,7 @@ def _run_cluster_ba(
     if drop_camera_with_no_track:
         gtsfm_data, should_run_ba = data_utils.remove_cameras_with_no_tracks(gtsfm_data, "cluster-level BA")
         if not should_run_ba:
-            return gtsfm_data, pre_ba_data
+            return gtsfm_data, pre_ba_data, depth_stats
 
     try:
         optimizer = ba_options.to_optimizer(min_track_length=min_track_length)
@@ -90,6 +91,7 @@ def _run_cluster_ba(
         optimizer._depth_arrays = depth_arrays
         optimizer._image_fnames = image_fnames
         gtsfm_data_with_ba, _ = optimizer.run_simple_ba(gtsfm_data)
+        depth_stats = dict(optimizer._depth_factor_stats)
 
         gtsfm_data_with_ba = gtsfm_data_with_ba.filter_landmark_measurements(
             post_ba_max_reproj_error
@@ -101,10 +103,10 @@ def _run_cluster_ba(
             gtsfm_data_with_ba.number_tracks(),
             gtsfm_data.number_tracks(),
         )
-        return gtsfm_data_with_ba, pre_ba_data
+        return gtsfm_data_with_ba, pre_ba_data, depth_stats
     except Exception as exc:
         logger.warning("⚠️ Failed to run bundle adjustment: %s", exc)
-        return gtsfm_data, pre_ba_data
+        return gtsfm_data, pre_ba_data, depth_stats
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +360,7 @@ def _aggregate_vggt_metrics(
     *,
     save_dir: Optional[str] = None,
     metric_constructed_only: bool = False,
+    depth_factor_stats: Optional[dict[str, int]] = None,
 ) -> list[GtsfmMetricsGroup]:
     """Aggregate VGGT metrics into groups for both pre- and post-BA results."""
     def _build_metrics_group(scene: GtsfmData, name: str) -> GtsfmMetricsGroup:
@@ -376,6 +379,13 @@ def _aggregate_vggt_metrics(
         return metrics_group
 
     metrics_groups = [_build_metrics_group(result, "cluster_vggt_metrics")]
+    if depth_factor_stats:
+        metrics_groups.append(
+            GtsfmMetricsGroup(
+                "depth_factor_metrics",
+                [GtsfmMetric(f"num_depth_factors_{k}", v) for k, v in depth_factor_stats.items()],
+            )
+        )
     if pre_ba_result is not None:
         metrics_groups.append(_build_metrics_group(pre_ba_result, "cluster_vggt_pre_ba_metrics"))
     return metrics_groups
@@ -526,7 +536,7 @@ class ClusterVGGT(ClusterOptimizerBase):
         # 3. Run cluster-level BA. Pass the in-memory VGGT depth (keyed by global
         # camera index) so opt-in depth factors fire without any on-disk maps.
         image_fnames = {idx: name for idx, name in zip(global_indices, image_names)}
-        ba_result_graph, pre_ba_result_graph = delayed(_run_cluster_ba, nout=2)(
+        ba_result_graph, pre_ba_result_graph, depth_stats_graph = delayed(_run_cluster_ba, nout=3)(
             pre_ba_data_graph,
             ba_options=self.ba_options,
             depth_arrays=depth_arrays_graph,
@@ -547,6 +557,7 @@ class ClusterVGGT(ClusterOptimizerBase):
                 pre_ba_result=pre_ba_result_graph,
                 save_dir=str(context.output_paths.metrics),
                 metric_constructed_only=self._metric_constructed_only,
+                depth_factor_stats=depth_stats_graph,
             )
         ]
 

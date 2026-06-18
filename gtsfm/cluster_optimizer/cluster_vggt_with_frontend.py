@@ -354,7 +354,7 @@ class ClusterVGGTWithFrontend(ClusterMVO):
         )
 
         # 6. Cluster-level BA.
-        ba_result_graph, pre_ba_result_graph = delayed(_run_cluster_ba, nout=2)(
+        ba_result_graph, pre_ba_result_graph, depth_stats_graph = delayed(_run_cluster_ba, nout=3)(
             ba_input_graph,
             ba_options=self.ba_options,
             pre_ba_max_reproj_error=self._pre_ba_max_reproj_error,
@@ -373,6 +373,7 @@ class ClusterVGGTWithFrontend(ClusterMVO):
                 pre_ba_result=pre_ba_result_graph,
                 save_dir=str(context.output_paths.metrics),
                 metric_constructed_only=self._metric_constructed_only,
+                depth_factor_stats=depth_stats_graph,
             )
         )
         with self._output_annotation():
