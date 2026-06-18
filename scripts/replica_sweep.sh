@@ -69,7 +69,6 @@ uv run python -m gtsfm.runner \
 echo "=== [2/3] Geometry eval vs GT mesh ==="
 uv run python gtsfm/evaluation/eval_geometry_vs_mesh.py \
     --ba_dir $OUT/results/ba_output \
-    --gt_cameras_dir $OUT/results/ba_gt \
     --gt_traj $DATA/$SEQ/traj.txt \
     --gt_ply $DATA/${SEQ}_mesh.ply \
     --out $OUT/geometry_metrics.json
