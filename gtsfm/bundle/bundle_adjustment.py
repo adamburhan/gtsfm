@@ -469,7 +469,6 @@ class BundleAdjustmentOptimizer:
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
         self._depth_provider = None
-        self._depth_factor_stats = None
 
         # Post-BA multi-view retriangulation (opt-in). See `__init__` docstring above.
         self._use_multi_view_retriangulation = use_multi_view_retriangulation
