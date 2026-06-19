@@ -10,11 +10,21 @@ Answers two questions from the post-hoc analysis:
   1. Does the optimizer ever end up at the non-naive mode (mode 2)?
   2. When it does, does that landmark land closer to the GT surface?
 
+Question 2 is answered as a per-landmark counterfactual: for every landmark that
+switched to mode 2 in the bimodal run, compare its distance-to-GT against the
+same landmark's position in the unimodal run (--unimodal_ba_dir). This avoids
+the confound of comparing different landmarks (mode-1 vs mode-2 are different
+points in different parts of the scene).
+
+Note: bimodal and unimodal runs start from identical frontends and data
+association, so track index j is the same landmark in both ba_outputs.
+
 Usage:
     python scripts/diag_bimodal_mode_selection.py \\
-        --ba_dir /path/to/results/ba_output \\
+        --ba_dir /path/to/bimodal/results/ba_output \\
         --depth_map_dir /path/to/Replica/office0/results \\
-        --gap_thresh 0.05 \\
+        --gap_thresh 0.10 \\
+        [--unimodal_ba_dir /path/to/unimodal/results/ba_output] \\
         [--gt_ply /path/to/office0_mesh.ply] \\
         [--gt_traj /path/to/Replica/office0/traj.txt]
 
@@ -22,13 +32,11 @@ Authors: Adam Burhan
 """
 
 import argparse
-import re
 import sys
 from pathlib import Path
 
 import numpy as np
 
-# Allow running from repo root without install.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gtsfm.common.depth_provider import DepthProvider
@@ -49,14 +57,10 @@ def _build_image_fnames(data: GtsfmData) -> dict[int, str]:
 def _analyze(data: GtsfmData, provider: DepthProvider) -> dict:
     """Check mode selection for every bimodal-candidate measurement.
 
-    Returns a dict with summary stats and per-measurement arrays.
+    Returns summary stats and a list of per-measurement record dicts.
     """
-    n_candidates = 0
-    n_mode1 = 0
-    n_mode2 = 0
-
-    # Per bimodal-candidate: (d, d_alt, z_pred, mode_selected)
     records = []
+    n_mode1 = n_mode2 = 0
 
     for j in range(data.number_tracks()):
         track = data.get_track(j)
@@ -69,21 +73,14 @@ def _analyze(data: GtsfmData, provider: DepthProvider) -> dict:
                 continue
 
             sample = provider.get_depth(i, float(uv[0]), float(uv[1]))
-            if sample is None or not sample.ambiguous:
+            if sample is None or not sample.ambiguous or sample.depth_alt is None:
                 continue
 
-            d, d_alt = sample.depth, sample.depth_alt
-            if d_alt is None:
-                continue
-
-            n_candidates += 1
-
-            # Mirror the factor's computation exactly.
+            # Mirror make_bimodal_depth_factor exactly.
             point_c = camera.pose().transformTo(point_w)
             z_pred = float(point_c[2])
-
-            r1 = abs(z_pred - d)
-            r2 = abs(z_pred - d_alt)
+            r1 = abs(z_pred - sample.depth)
+            r2 = abs(z_pred - sample.depth_alt)
             mode = 2 if r2 < r1 else 1
 
             if mode == 1:
@@ -91,62 +88,61 @@ def _analyze(data: GtsfmData, provider: DepthProvider) -> dict:
             else:
                 n_mode2 += 1
 
-            records.append(
-                {
-                    "track_idx": j,
-                    "cam_idx": i,
-                    "d": d,
-                    "d_alt": d_alt,
-                    "z_pred": z_pred,
-                    "r1": r1,
-                    "r2": r2,
-                    "mode": mode,
-                    "point_w": point_w.copy(),
-                }
-            )
+            records.append({
+                "track_idx": j,
+                "cam_idx": i,
+                "d": sample.depth,
+                "d_alt": sample.depth_alt,
+                "z_pred": z_pred,
+                "r1": r1,
+                "r2": r2,
+                "mode": mode,
+                "point_w": point_w.copy(),
+            })
 
-    return {
-        "n_candidates": n_candidates,
-        "n_mode1": n_mode1,
-        "n_mode2": n_mode2,
-        "records": records,
-    }
+    return {"n_candidates": len(records), "n_mode1": n_mode1, "n_mode2": n_mode2, "records": records}
 
 
-def _mesh_distances(points_w: np.ndarray, gt_ply: str, gt_traj: str, data: GtsfmData) -> np.ndarray:
-    """Return point-to-GT-surface distances for each row of points_w (world frame).
+def _load_gt_surface(gt_ply: str, n_samples: int = 500_000) -> np.ndarray:
+    """Load GT surface as a dense point cloud. Uses trimesh first (handles quads)."""
+    import trimesh
+    import trimesh.sample
 
-    Performs the same Sim3 alignment as eval_geometry_vs_mesh.py so that the
-    reconstruction's world frame matches the GT mesh frame.
-    """
-    try:
-        import trimesh
-        from scipy.spatial import cKDTree
+    tm = trimesh.load(gt_ply, process=False, force="mesh")
+    faces = getattr(tm, "faces", None)
+    if faces is not None and len(faces) > 0:
+        pts = trimesh.sample.sample_surface(tm, n_samples)[0]
+        return np.asarray(pts, dtype=np.float64)
+    # Quad / degenerate mesh: fall back to raw vertices (still a valid surface proxy).
+    print("[mesh] WARNING: trimesh found no triangulated faces; using raw vertices as GT surface.")
+    vertices = getattr(tm, "vertices", None)
+    if vertices is None:
+        raise RuntimeError(f"Could not extract any geometry from {gt_ply}")
+    return np.asarray(vertices, dtype=np.float64)
 
-        import open3d as o3d
 
-        from gtsfm.evaluation.eval_geometry_vs_mesh import align_recon_to_world, load_gt_points
-    except ImportError as e:
-        print(f"[mesh] Skipping mesh comparison — missing dependency: {e}")
-        return np.full(len(points_w), np.nan)
+def _build_gt_tree(gt_ply: str, gt_traj: str, data: GtsfmData):
+    """Return (KDTree of GT surface in world frame, wSr Sim3 aligning recon→world)."""
+    from scipy.spatial import cKDTree  # type: ignore[import-untyped]
+    from gtsfm.evaluation.eval_geometry_vs_mesh import align_recon_to_world
 
-    wTi_list = [data.get_camera(i).pose() if data.get_camera(i) is not None else None
-                for i in data.get_valid_camera_indices()]
+    gt_pts = _load_gt_surface(gt_ply)
+    print(f"[mesh] GT surface: {len(gt_pts):,} sampled points")
+
+    wTi_list = []
+    for i in data.get_valid_camera_indices():
+        cam = data.get_camera(i)
+        wTi_list.append(cam.pose() if cam is not None else None)
     img_fnames = [data.get_image_info(i).name for i in data.get_valid_camera_indices()]
+    wSr, rms = align_recon_to_world(wTi_list, img_fnames, gt_traj)
+    print(f"[mesh] Sim3 alignment RMS camera-centre residual: {rms*100:.2f} cm")
 
-    try:
-        wSr, rms = align_recon_to_world(wTi_list, img_fnames, gt_traj)
-        print(f"[mesh] Sim3 alignment RMS camera-centre residual: {rms * 100:.2f} cm")
-    except Exception as e:
-        print(f"[mesh] Alignment failed: {e}. Using identity.")
-        import gtsam
-        wSr = gtsam.Similarity3()
+    return cKDTree(gt_pts), wSr
 
-    aligned = np.array([wSr.transformFrom(p) for p in points_w])
-    gt_pts = load_gt_points(gt_ply)
-    tree = cKDTree(gt_pts)
-    dists, _ = tree.query(aligned, k=1)
-    return dists
+
+def _dist_to_gt(points_world: np.ndarray, tree, wSr) -> np.ndarray:  # type: ignore[type-arg]
+    aligned = np.array([wSr.transformFrom(p) for p in points_world])
+    return tree.query(aligned, k=1)[0]  # type: ignore[return-value]
 
 
 # --------------------------------------------------------------------------- #
@@ -156,38 +152,36 @@ def _mesh_distances(points_w: np.ndarray, gt_ply: str, gt_traj: str, data: Gtsfm
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ba_dir", required=True,
-                        help="COLMAP-format BA output dir (cameras.txt / images.txt / points3D.txt).")
+                        help="Bimodal run: COLMAP-format BA output dir.")
     parser.add_argument("--depth_map_dir", required=True,
                         help="Directory containing per-image depth PNGs (e.g. Replica/<seq>/results).")
     parser.add_argument("--gap_thresh", type=float, default=0.05,
                         help="Log-depth gap threshold used during the sweep (default: 0.05).")
     parser.add_argument("--depth_scale", type=float, default=6553.5,
-                        help="Divisor to convert raw uint16 depth to metres (default: 6553.5 for Replica).")
+                        help="uint16→metres divisor (default: 6553.5 for Replica).")
     parser.add_argument("--depth_min", type=float, default=0.1)
     parser.add_argument("--depth_max", type=float, default=20.0)
     parser.add_argument("--patch_radius", type=int, default=5)
-    parser.add_argument("--depth_filename_template", default="depth{:06d}.png",
-                        help="Template mapping trailing image-stem digits to depth filename.")
-    # Optional mesh comparison.
+    parser.add_argument("--depth_filename_template", default="depth{:06d}.png")
+    # Counterfactual comparison.
+    parser.add_argument("--unimodal_ba_dir", default=None,
+                        help="Unimodal run: BA output dir (same scene/frontend). "
+                             "Enables per-landmark counterfactual comparison.")
+    # GT geometry.
     parser.add_argument("--gt_ply", default=None,
-                        help="GT mesh PLY for point-to-surface comparison (optional).")
+                        help="GT mesh PLY for point-to-surface distances.")
     parser.add_argument("--gt_traj", default=None,
-                        help="Replica traj.txt for Sim3 alignment before mesh comparison (optional).")
+                        help="Replica traj.txt for Sim3 alignment (required with --gt_ply).")
     args = parser.parse_args()
 
     # ------------------------------------------------------------------ #
-    # Load reconstruction                                                 #
+    # Load bimodal reconstruction                                         #
     # ------------------------------------------------------------------ #
-    print(f"Loading BA output from: {args.ba_dir}")
+    print(f"Loading bimodal BA output: {args.ba_dir}")
     data = GtsfmData.read_colmap(args.ba_dir)
-    n_cams = len(data.get_valid_camera_indices())
-    n_tracks = data.number_tracks()
-    print(f"  {n_cams} cameras, {n_tracks} tracks")
+    print(f"  {len(data.get_valid_camera_indices())} cameras, {data.number_tracks()} tracks")
 
     image_fnames = _build_image_fnames(data)
-    missing = sum(1 for v in image_fnames.values() if v is None)
-    if missing:
-        print(f"  WARNING: {missing} cameras have no image filename; depth sampling will skip them.")
 
     # ------------------------------------------------------------------ #
     # Build DepthProvider (same settings as the sweep)                   #
@@ -202,8 +196,8 @@ def main() -> None:
         compute_hypotheses=True,
         patch_radius=args.patch_radius,
         gap_thresh=args.gap_thresh,
-        ambiguity_thresh=0.0,   # unused in current _analyze_patch
-        min_valid=3,            # hardcoded in current _analyze_patch
+        ambiguity_thresh=0.0,  # currently unused in _analyze_patch
+        min_valid=3,           # hardcoded in _analyze_patch
     )
 
     # ------------------------------------------------------------------ #
@@ -212,70 +206,104 @@ def main() -> None:
     print(f"\nAnalyzing mode selection (gap_thresh={args.gap_thresh}) ...")
     result = _analyze(data, provider)
     n_cand = result["n_candidates"]
-    n1 = result["n_mode1"]
-    n2 = result["n_mode2"]
+    n1, n2 = result["n_mode1"], result["n_mode2"]
     records = result["records"]
 
     print(f"\n{'='*60}")
     print(f"Bimodal-candidate measurements : {n_cand}")
     if n_cand == 0:
-        print("No bimodal candidates found. Check gap_thresh or depth_map_dir.")
+        print("No bimodal candidates found. Check --gap_thresh or --depth_map_dir.")
         return
-
     print(f"  Mode 1 (primary d)  selected : {n1}  ({100*n1/n_cand:.1f}%)")
     print(f"  Mode 2 (alt  d_alt) selected : {n2}  ({100*n2/n_cand:.1f}%)")
     print(f"{'='*60}\n")
 
-    if n_cand > 0:
-        r1s = np.array([r["r1"] for r in records])
-        r2s = np.array([r["r2"] for r in records])
-        print("Depth residual statistics across all bimodal candidates (metres):")
-        print(f"  |z_pred - d|     : median={np.median(r1s):.4f}  mean={np.mean(r1s):.4f}  p95={np.percentile(r1s,95):.4f}")
-        print(f"  |z_pred - d_alt| : median={np.median(r2s):.4f}  mean={np.mean(r2s):.4f}  p95={np.percentile(r2s,95):.4f}")
-
-        gaps = np.array([abs(r["d"] - r["d_alt"]) for r in records])
-        print(f"\n  |d - d_alt| (hypothesis spread):")
-        print(f"    median={np.median(gaps):.4f} m  mean={np.mean(gaps):.4f} m  p95={np.percentile(gaps,95):.4f} m")
+    r1s = np.array([r["r1"] for r in records])
+    r2s = np.array([r["r2"] for r in records])
+    gaps = np.array([abs(r["d"] - r["d_alt"]) for r in records])
+    print("Depth residuals across all bimodal candidates (metres):")
+    print(f"  |z_pred - d|     median={np.median(r1s):.4f}  mean={np.mean(r1s):.4f}  p95={np.percentile(r1s,95):.4f}")
+    print(f"  |z_pred - d_alt| median={np.median(r2s):.4f}  mean={np.mean(r2s):.4f}  p95={np.percentile(r2s,95):.4f}")
+    print(f"  |d - d_alt| (hypothesis spread):")
+    print(f"    median={np.median(gaps):.4f} m  mean={np.mean(gaps):.4f} m  p95={np.percentile(gaps,95):.4f} m")
 
     if n2 > 0:
-        mode2 = [r for r in records if r["mode"] == 2]
-        improvement = np.array([r["r1"] - r["r2"] for r in mode2])  # positive = mode2 is better
+        mode2_recs = [r for r in records if r["mode"] == 2]
+        improvement = np.array([r["r1"] - r["r2"] for r in mode2_recs])
         print(f"\nFor the {n2} mode-2 selections:")
         print(f"  Residual improvement |r1|-|r2| (m):")
         print(f"    median={np.median(improvement):.4f}  mean={np.mean(improvement):.4f}  p95={np.percentile(improvement,95):.4f}")
 
-        z_preds = np.array([r["z_pred"] for r in mode2])
-        ds = np.array([r["d"] for r in mode2])
-        d_alts = np.array([r["d_alt"] for r in mode2])
-        print(f"  z_pred vs d vs d_alt (metres):")
-        print(f"    median z_pred  = {np.median(z_preds):.4f}")
-        print(f"    median d       = {np.median(ds):.4f}")
-        print(f"    median d_alt   = {np.median(d_alts):.4f}")
+        z_preds = np.array([r["z_pred"] for r in mode2_recs])
+        ds = np.array([r["d"] for r in mode2_recs])
+        d_alts = np.array([r["d_alt"] for r in mode2_recs])
+        print(f"  z_pred / d / d_alt (metres):")
+        print(f"    median z_pred={np.median(z_preds):.4f}  d={np.median(ds):.4f}  d_alt={np.median(d_alts):.4f}")
 
     # ------------------------------------------------------------------ #
-    # Mesh comparison (optional)                                          #
+    # Counterfactual mesh comparison (optional)                           #
     # ------------------------------------------------------------------ #
-    if args.gt_ply is not None:
-        if args.gt_traj is None:
+    if args.gt_ply is None or args.gt_traj is None:
+        if args.gt_ply is not None:
             print("\n[mesh] --gt_traj required for Sim3 alignment; skipping mesh comparison.")
-        else:
-            print(f"\nMesh comparison vs: {args.gt_ply}")
+        print("\nDone.")
+        return
 
-            # Unique track indices for mode-1 and mode-2 (one 3D point per track).
-            mode1_tracks = {r["track_idx"]: r["point_w"] for r in records if r["mode"] == 1}
-            mode2_tracks = {r["track_idx"]: r["point_w"] for r in records if r["mode"] == 2}
+    print(f"\nBuilding GT surface KD-tree from: {args.gt_ply}")
+    tree, wSr = _build_gt_tree(args.gt_ply, args.gt_traj, data)
 
-            if mode1_tracks:
-                pts1 = np.stack(list(mode1_tracks.values()))
-                d1 = _mesh_distances(pts1, args.gt_ply, args.gt_traj, data)
-                print(f"\n  Mode-1 tracks ({len(pts1)} unique landmarks):")
-                print(f"    dist-to-GT  median={np.nanmedian(d1)*100:.2f} cm  mean={np.nanmean(d1)*100:.2f} cm  p95={np.nanpercentile(d1,95)*100:.2f} cm")
+    # Unique mode-2 track indices (one 3D point per track, multiple measurements may vote for mode 2).
+    mode2_track_indices = sorted({r["track_idx"] for r in records if r["mode"] == 2})
+    print(f"\n{len(mode2_track_indices)} unique landmarks switched to mode 2.")
 
-            if mode2_tracks:
-                pts2 = np.stack(list(mode2_tracks.values()))
-                d2 = _mesh_distances(pts2, args.gt_ply, args.gt_traj, data)
-                print(f"\n  Mode-2 tracks ({len(pts2)} unique landmarks):")
-                print(f"    dist-to-GT  median={np.nanmedian(d2)*100:.2f} cm  mean={np.nanmean(d2)*100:.2f} cm  p95={np.nanpercentile(d2,95)*100:.2f} cm")
+    # Bimodal positions for those tracks.
+    bimodal_pts = np.array([np.array(data.get_track(j).point3()) for j in mode2_track_indices])
+    d_bimodal = _dist_to_gt(bimodal_pts, tree, wSr)
+
+    if args.unimodal_ba_dir is not None:
+        # Per-landmark counterfactual: bimodal position vs unimodal position.
+        # Track index j is the same landmark in both runs (identical frontend + data association).
+        print(f"Loading unimodal BA output: {args.unimodal_ba_dir}")
+        uni_data = GtsfmData.read_colmap(args.unimodal_ba_dir)
+        n_uni = uni_data.number_tracks()
+        print(f"  {n_uni} tracks")
+
+        valid_indices = [j for j in mode2_track_indices if j < n_uni]
+        skipped = len(mode2_track_indices) - len(valid_indices)
+        if skipped:
+            print(f"  WARNING: {skipped} mode-2 track indices exceed unimodal track count; skipping them.")
+
+        if valid_indices:
+            uni_pts = np.array([np.array(uni_data.get_track(j).point3()) for j in valid_indices])
+            d_uni = _dist_to_gt(uni_pts, tree, wSr)
+            d_bim_valid = _dist_to_gt(
+                np.array([np.array(data.get_track(j).point3()) for j in valid_indices]),
+                tree, wSr,
+            )
+
+            delta = d_uni - d_bim_valid  # positive = bimodal moved the point closer to GT
+            n_total = len(valid_indices)
+            n_improved = int((delta > 0).sum())
+
+            print(f"\n{'='*60}")
+            print(f"COUNTERFACTUAL: mode-2 landmarks, bimodal vs unimodal")
+            print(f"{'='*60}")
+            print(f"  Landmarks compared          : {n_total}")
+            print(f"  Bimodal closer to GT        : {n_improved} / {n_total}  ({100*n_improved/n_total:.1f}%)")
+            print(f"  Median improvement (cm)     : {np.median(delta)*100:+.2f}")
+            print(f"  Mean   improvement (cm)     : {np.mean(delta)*100:+.2f}")
+            print(f"  p25 / p75 improvement (cm)  : {np.percentile(delta,25)*100:+.2f} / {np.percentile(delta,75)*100:+.2f}")
+            print(f"\n  dist-to-GT (cm):")
+            print(f"    bimodal  median={np.median(d_bim_valid)*100:.2f}  mean={np.mean(d_bim_valid)*100:.2f}  p95={np.percentile(d_bim_valid,95)*100:.2f}")
+            print(f"    unimodal median={np.median(d_uni)*100:.2f}  mean={np.mean(d_uni)*100:.2f}  p95={np.percentile(d_uni,95)*100:.2f}")
+    else:
+        # No unimodal run — just report mode-2 landmark distances.
+        print(f"\nMode-2 landmark distances to GT (cm) [mode-1 vs mode-2 landmarks are different points — provide --unimodal_ba_dir for a fair comparison]:")
+        mode1_track_indices = sorted({r["track_idx"] for r in records if r["mode"] == 1})
+        bimodal_mode1_pts = np.array([np.array(data.get_track(j).point3()) for j in mode1_track_indices])
+        d_mode1 = _dist_to_gt(bimodal_mode1_pts, tree, wSr)
+        print(f"  mode-1 landmarks ({len(mode1_track_indices)}): median={np.median(d_mode1)*100:.2f}  mean={np.mean(d_mode1)*100:.2f}")
+        print(f"  mode-2 landmarks ({len(mode2_track_indices)}): median={np.median(d_bimodal)*100:.2f}  mean={np.mean(d_bimodal)*100:.2f}")
 
     print("\nDone.")
 
