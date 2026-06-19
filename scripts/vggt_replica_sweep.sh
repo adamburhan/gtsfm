@@ -18,15 +18,16 @@ set -eo pipefail
 
 module load cuda/12.6.0
 
-SEQ=${1:?usage: vggt_replica_sweep.sh <sequence> <depth_model> [stride] [gs_max_steps]}
+SEQ=${1:?usage: vggt_replica_sweep.sh <sequence> <depth_model> [stride] [gs_max_steps] [gap_thresh]}
 MODE=${2:?depth_model: none | unimodal | drop_ambiguous | bimodal}
 STRIDE=${3:-10}
 GS_STEPS=${4:-7000}
+GAPTHRESH=${5:-0.15}
 
 project_name="gtsfm"
 project_root="$HOME/repos/$project_name"
 DATA="$SCRATCH/datasets/replica/Replica"
-OUT="$SCRATCH/logs/cluv/$SLURM_JOB_ID/${SEQ}_${MODE}"
+OUT="$SCRATCH/logs/cluv/$SLURM_JOB_ID/${SEQ}_${MODE}_${GAPTHRESH}"
 
 echo "GIT_COMMIT=${GIT_COMMIT:?GIT_COMMIT is not set. Use 'cluv submit' to submit this job script.}"
 cd $SLURM_TMPDIR
@@ -54,8 +55,9 @@ uv run python -m gtsfm.runner \
     loader.sequence=$SEQ \
     loader.stride=$STRIDE \
     $BA.depth_model=$MODE \
-    $BA.depth_map_dir=$DATA/$SEQ/results \
-    $BA.depth_scale=6553.5
+    $BA.depth_min=0.0 \
+    $BA.depth_max=1e9 \
+    $BA.depth_gap_thresh=$GAPTHRESH
 
 echo "=== [2/3] Geometry eval vs GT mesh ==="
 uv run python gtsfm/evaluation/eval_geometry_vs_mesh.py \
