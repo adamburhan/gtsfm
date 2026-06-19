@@ -273,6 +273,26 @@ def main() -> None:
         if skipped:
             print(f"  WARNING: {skipped} mode-2 track indices exceed unimodal track count; skipping them.")
 
+        # Verify track correspondence: if BA filtering removed different tracks in each
+        # run, index j in bimodal and index j in unimodal are different landmarks.
+        # Check by comparing the first measurement (camera_idx, pixel) of each track.
+        n_check = min(len(valid_indices), 50)
+        n_mismatch = 0
+        for j in valid_indices[:n_check]:
+            bi_cam, bi_uv = data.get_track(j).measurement(0)
+            uni_cam, uni_uv = uni_data.get_track(j).measurement(0)
+            if bi_cam != uni_cam or not np.allclose(bi_uv, uni_uv, atol=0.5):
+                n_mismatch += 1
+        print(f"\n  Track correspondence check ({n_check} sampled):")
+        print(f"    Mismatched by first measurement: {n_mismatch}/{n_check}")
+        if n_mismatch > 0:
+            print(f"    WARNING: index mismatch detected — counterfactual comparison is invalid.")
+            print(f"    The {n_mismatch}/{n_check} mismatches mean BA filtering removed different")
+            print(f"    tracks in each run, shifting subsequent indices. Re-run with pixel-matched")
+            print(f"    track correspondence to get valid results.")
+        else:
+            print(f"    OK — all sampled indices map to the same landmark in both runs.")
+
         if valid_indices:
             uni_pts = np.array([np.array(uni_data.get_track(j).point3()) for j in valid_indices])
             d_uni = _dist_to_gt(uni_pts, tree, wSr)
