@@ -296,6 +296,36 @@ def main() -> None:
             print(f"\n  dist-to-GT (cm):")
             print(f"    bimodal  median={np.median(d_bim_valid)*100:.2f}  mean={np.mean(d_bim_valid)*100:.2f}  p95={np.percentile(d_bim_valid,95)*100:.2f}")
             print(f"    unimodal median={np.median(d_uni)*100:.2f}  mean={np.mean(d_uni)*100:.2f}  p95={np.percentile(d_uni,95)*100:.2f}")
+
+            # ---- Gap-stratified breakdown --------------------------------- #
+            # For each mode-2 track, take the max |d - d_alt| across its
+            # measurements (largest observed discontinuity for that landmark).
+            track_max_gap: dict[int, float] = {}
+            for r in records:
+                if r["mode"] == 2:
+                    j = r["track_idx"]
+                    track_max_gap[j] = max(track_max_gap.get(j, 0.0), abs(r["d"] - r["d_alt"]))
+
+            valid_gaps = np.array([track_max_gap.get(j, 0.0) for j in valid_indices])
+            q25, q50, q75 = np.percentile(valid_gaps, [25, 50, 75])
+
+            print(f"\n  Gap-stratified (|d - d_alt|):")
+            print(f"  {'Gap range':<22}  {'n':>4}  {'closer':>9}  {'median Δ':>10}  {'mean Δ':>8}")
+            bins = [
+                (0.0,  q25,  f"Q1  ≤{q25*100:.1f} cm"),
+                (q25,  q50,  f"Q2  {q25*100:.1f}–{q50*100:.1f} cm"),
+                (q50,  q75,  f"Q3  {q50*100:.1f}–{q75*100:.1f} cm"),
+                (q75,  np.inf, f"Q4  >{q75*100:.1f} cm"),
+            ]
+            for lo, hi, label in bins:
+                mask = (valid_gaps >= lo) & (valid_gaps < hi)
+                if not mask.any():
+                    continue
+                dq = delta[mask]
+                nq = int(mask.sum())
+                ni = int((dq > 0).sum())
+                print(f"  {label:<22}  {nq:>4}  {ni:>4}/{nq} ({100*ni/nq:2.0f}%)  "
+                      f"{np.median(dq)*100:>+8.2f} cm  {np.mean(dq)*100:>+6.2f} cm")
     else:
         # No unimodal run — just report mode-2 landmark distances.
         print(f"\nMode-2 landmark distances to GT (cm) [mode-1 vs mode-2 landmarks are different points — provide --unimodal_ba_dir for a fair comparison]:")
