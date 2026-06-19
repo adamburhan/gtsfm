@@ -65,6 +65,10 @@ cluster_optimizer:
       use_gnc: true
       gnc_loss: GMC
       factor_weight_outlier_threshold: 1e-8
+      depth_model: "none"
+      depth_min: 0.0
+      depth_max: 1.0e9
+      depth_gap_thresh: 0.15
 
     # --- VGGT operational params ---
     input_mode: crop
