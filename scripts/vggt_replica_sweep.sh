@@ -35,7 +35,7 @@ git clone $project_root
 cd $project_name
 git checkout --detach $GIT_COMMIT
 cp -r $project_root/.venv .venv
-git submodule update --init thirdparty/vggt
+git submodule update --init thirdparty/vggt thirdparty/LightGlue
 
 # Copy model weights (untracked by git).
 for w in SuperGluePretrainedNetwork/models/weights hloc/weights vggt/weights; do
@@ -43,6 +43,7 @@ for w in SuperGluePretrainedNetwork/models/weights hloc/weights vggt/weights; do
 done
 uv sync
 uv pip install -e thirdparty/vggt/ --no-deps
+uv pip install -e thirdparty/LightGlue/ --no-deps
 
 mkdir -p $OUT
 
