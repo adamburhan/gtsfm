@@ -8,6 +8,7 @@ loader:
   dataset_dir: ???
   sequence: ???
   stride: 10
+  max_resolution: 760
 
 image_pairs_generator:
   _target_: gtsfm.retriever.image_pairs_generator.ImagePairsGenerator
