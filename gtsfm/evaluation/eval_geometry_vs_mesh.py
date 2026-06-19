@@ -32,6 +32,7 @@ from pathlib import Path
 import gtsam
 import numpy as np
 import open3d as o3d
+import trimesh
 from scipy.spatial import cKDTree
 
 import gtsfm.utils.io as io_utils
@@ -75,13 +76,19 @@ def align_recon_to_world(wTi_list, img_fnames, gt_traj: str) -> tuple[gtsam.Simi
 
 
 def load_gt_points(gt_ply: str) -> np.ndarray:
-    """Load GT geometry as a dense point cloud (sampling the surface if it is a mesh)."""
+    """Load GT geometry as a dense point cloud (sampling the surface if it is a mesh).
+
+    Falls back to trimesh when Open3D cannot triangulate the mesh (Replica PLYs use
+    quad/n-gon faces that `read_triangle_mesh` silently fails on), then to a raw
+    point-cloud read.
+    """
     mesh = o3d.io.read_triangle_mesh(gt_ply)
     if len(mesh.triangles) > 0:
-        pcd = mesh.sample_points_uniformly(number_of_points=N_GT_SAMPLES)
-    else:
-        pcd = o3d.io.read_point_cloud(gt_ply)
-    return np.asarray(pcd.points)
+        return np.asarray(mesh.sample_points_uniformly(number_of_points=N_GT_SAMPLES).points)
+    tm = trimesh.load(gt_ply, process=False, force="mesh")
+    if getattr(tm, "faces", None) is not None and len(tm.faces) > 0:
+        return np.asarray(trimesh.sample.sample_surface(tm, N_GT_SAMPLES)[0])
+    return np.asarray(o3d.io.read_point_cloud(gt_ply).points)
 
 
 def evaluate_points(points: np.ndarray, gt_points: np.ndarray, taus: list[float]) -> dict:
