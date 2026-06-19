@@ -35,12 +35,14 @@ git clone $project_root
 cd $project_name
 git checkout --detach $GIT_COMMIT
 cp -r $project_root/.venv .venv
+git submodule update --init thirdparty/vggt
 
 # Copy model weights (untracked by git).
 for w in SuperGluePretrainedNetwork/models/weights hloc/weights vggt/weights; do
     rsync -a $project_root/thirdparty/$w/ thirdparty/$w/
 done
 uv sync
+uv pip install -e thirdparty/vggt/ --no-deps
 
 mkdir -p $OUT
 
