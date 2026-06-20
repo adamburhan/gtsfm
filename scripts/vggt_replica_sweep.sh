@@ -64,14 +64,14 @@ uv run python -m gtsfm.runner \
 
 echo "=== [2/3] Geometry eval vs GT mesh ==="
 uv run python gtsfm/evaluation/eval_geometry_vs_mesh.py \
-    --ba_dir $OUT/results/vggt \
+    --ba_dir $OUT/results/merged \
     --gt_traj $DATA/$SEQ/traj.txt \
     --gt_ply $DATA/${SEQ}_mesh.ply \
     --out $OUT/geometry_metrics.json
 
 echo "=== [3/3] Gaussian splatting + NVS eval ==="
 uv run python scripts/gaussian_splatting/custom_trainer.py default \
-    --data_dir $OUT/results/vggt \
+    --data_dir $OUT/results/merged \
     --images_dir $DATA/$SEQ/results \
     --init_type sfm \
     --max_steps $GS_STEPS \
