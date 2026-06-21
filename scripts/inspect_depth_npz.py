@@ -38,6 +38,16 @@ def structural(npz_path: Path) -> dict[int, np.ndarray]:
 def correctness(arrays: dict[int, np.ndarray], recon_dir: Path, max_meas: int, tol: float) -> None:
     """Tier 2: depth-at-pixel vs point camera-frame Z over the sibling reconstruction."""
     data = GtsfmData.read_colmap(str(recon_dir))
+    # read_colmap re-bases cameras + measurements to 0-based in sorted-filename order, dropping
+    # the global index that depth arrays are keyed by. Loader index order == filename order, so
+    # sorted depth keys align positionally with read_colmap's 0-based indices. Re-key to match.
+    global_keys = sorted(arrays)
+    cam_idxs = data.get_valid_camera_indices()
+    if len(cam_idxs) != len(global_keys):
+        print(f"  [correct] {recon_dir.name}: {len(cam_idxs)} recon cams != {len(global_keys)} depth cams; "
+              "cannot align indices, skipped")
+        return
+    arrays = {local: arrays[g] for local, g in enumerate(global_keys)}
     provider = DepthProvider(depth_arrays=arrays, depth_min=0.0, depth_max=1e9, compute_hypotheses=False)
 
     ratios, n_none, n = [], 0, 0
