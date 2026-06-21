@@ -43,7 +43,7 @@ def load_gt_surface(gt_ply: str, n_samples: int = 500_000) -> np.ndarray:
 
 def build_gt_tree(gt_ply: str, gt_traj: str, data: GtsfmData):
     from scipy.spatial import cKDTree  # type: ignore[import-untyped]
-    from gtsfm.evaluation.eval_geometry_vs_mesh import align_recon_to_world
+    from gtsfm.evaluation.eval_geometry import align_recon_to_world
 
     gt_pts = load_gt_surface(gt_ply)
     print(f"GT surface: {len(gt_pts):,} points")

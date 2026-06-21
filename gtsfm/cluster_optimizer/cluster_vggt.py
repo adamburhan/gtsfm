@@ -300,6 +300,19 @@ def _save_pre_ba_reconstruction_as_text(
     _save_reconstruction_as_text(pre_ba_result, results_path, subdir="vggt_pre_ba")
 
 
+def _save_depth_arrays(depth_arrays: Optional[dict[int, np.ndarray]], results_path: Path) -> None:
+    """Persist this cluster's VGGT depth (keyed by global camera index) for post-hoc eval.
+
+    The in-memory depth is released when the job ends, so without this the ambiguous-subset
+    and mode-correctness metrics cannot be recomputed for VGGT runs. No-op when depth was not
+    extracted (depth_model == none).
+    """
+    if not depth_arrays:
+        return
+    results_path.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(results_path / "depth.npz", **{str(i): d for i, d in depth_arrays.items()})
+
+
 def _get_pose_metrics(
     result_data: GtsfmData,
     cameras_gt: list[Optional[gtsfm_types.CAMERA_TYPE]],
@@ -573,6 +586,12 @@ class ClusterVGGT(ClusterOptimizerBase):
             io_tasks.append(
                 delayed(_save_pre_ba_reconstruction_as_text)(
                     pre_ba_result_graph,
+                    context.output_paths.results,
+                )
+            )
+            io_tasks.append(
+                delayed(_save_depth_arrays)(
+                    depth_arrays_graph,
                     context.output_paths.results,
                 )
             )

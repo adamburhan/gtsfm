@@ -7,7 +7,7 @@ import unittest
 
 import numpy as np
 
-from gtsfm.evaluation.eval_geometry_vs_mesh import evaluate_points
+from gtsfm.evaluation.eval_geometry import evaluate_points
 
 
 class TestEvaluatePoints(unittest.TestCase):
