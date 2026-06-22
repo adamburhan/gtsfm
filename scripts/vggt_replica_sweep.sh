@@ -63,7 +63,7 @@ uv run python -m gtsfm.runner \
     $BA.depth_gap_thresh=$GAPTHRESH
 
 echo "=== [2/3] Geometry eval vs GT mesh ==="
-uv run python gtsfm/evaluation/eval_geometry_vs_mesh.py \
+uv run python gtsfm/evaluation/eval_geometry.py \
     --sfm_output $OUT/results/merged \
     --align_mode replica \
     --align_ref $DATA/${SEQ}/traj.txt \

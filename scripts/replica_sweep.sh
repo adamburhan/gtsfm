@@ -67,9 +67,10 @@ uv run python -m gtsfm.runner \
     $BA.depth_ambiguity_thresh=0.0
 
 echo "=== [2/3] Geometry eval vs GT mesh ==="
-uv run python gtsfm/evaluation/eval_geometry_vs_mesh.py \
-    --ba_dir $OUT/results/ba_output \
-    --gt_traj $DATA/$SEQ/traj.txt \
+uv run python gtsfm/evaluation/eval_geometry.py \
+    --sfm_output $OUT/results/ba_output \
+    --align_mode replica \
+    --align_ref $DATA/$SEQ/traj.txt \
     --gt_ply $DATA/${SEQ}_mesh.ply \
     --out $OUT/geometry_metrics.json
 
