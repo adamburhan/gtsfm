@@ -137,14 +137,14 @@ def build_provider(args, data: GtsfmData):
         return DepthProvider(
             depth_arrays=_load_depth_npz(args.depth_npz, data),
             depth_min=args.depth_min, depth_max=args.depth_max, compute_hypotheses=True,
-            patch_radius=args.patch_radius, gap_thresh=args.gap_thresh, ambiguity_thresh=0.0, min_valid=3,
+            patch_radius=args.patch_radius, gap_thresh=args.gap_thresh, ambiguity_thresh=0.0, min_valid=args.min_valid,
         )
     if args.depth_map_dir:
         return DepthProvider(
             depth_map_dir=args.depth_map_dir, image_fnames=build_image_fnames(data),
             depth_scale=args.depth_scale, depth_filename_template=args.depth_filename_template,
             depth_min=args.depth_min, depth_max=args.depth_max, compute_hypotheses=True,
-            patch_radius=args.patch_radius, gap_thresh=args.gap_thresh, ambiguity_thresh=0.0, min_valid=3,
+            patch_radius=args.patch_radius, gap_thresh=args.gap_thresh, ambiguity_thresh=0.0, min_valid=args.min_valid,
         )
     return None
 
@@ -237,6 +237,7 @@ def main() -> None:
     parser.add_argument("--depth_max", type=float, default=20.0)
     parser.add_argument("--gap_thresh", type=float, default=0.10)
     parser.add_argument("--patch_radius", type=int, default=5)
+    parser.add_argument("--min_valid", type=int, default=10, help="Min valid patch pixels (match BA depth_min_valid).")
     parser.add_argument("--mode_tau", type=float, default=0.05, help="Oracle band: a hypothesis this close to GT counts as available.")
     args = parser.parse_args()
 
