@@ -62,12 +62,15 @@ def sim3_align(wTi_list, gt_poses: dict[int, gtsam.Pose3]) -> tuple[gtsam.Simila
 
 
 def load_gt_points(gt_ply: str) -> np.ndarray:
-    """GT geometry as a dense point cloud (trimesh sampling; falls back to raw vertices)."""
-    tm = trimesh.load(gt_ply, process=False, force="mesh")
-    if getattr(tm, "faces", None) is not None and len(tm.faces) > 0:
-        return np.asarray(trimesh.sample.sample_surface(tm, N_GT_SAMPLES)[0])
-    print("[load_gt_points] No triangulated faces; using raw vertices.")
-    return np.asarray(getattr(tm, "vertices", np.zeros((0, 3))))
+    """GT geometry as a point cloud: sample a mesh's surface, or use a point cloud's vertices.
+
+    No `force="mesh"`: that coerces a point-cloud PLY into a faceless mesh and silently drops
+    all points. Branch on the loaded type instead (Trimesh -> sample, PointCloud -> vertices).
+    """
+    geo = trimesh.load(gt_ply, process=False)
+    if hasattr(geo, "faces") and len(geo.faces) > 0:
+        return np.asarray(trimesh.sample.sample_surface(geo, N_GT_SAMPLES)[0])
+    return np.asarray(geo.vertices)
 
 
 def evaluate_points(points: np.ndarray, gt_points: np.ndarray, taus: list[float]) -> dict:
