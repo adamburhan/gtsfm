@@ -174,6 +174,7 @@ def mode_records(data: GtsfmData, provider, gt_tree: cKDTree, to_world) -> tuple
                 "opt_mode": opt_mode,
                 "gt_mode": 1 if dist_d < dist_alt else 2,
                 "dist_best": min(dist_d, dist_alt),
+                "dist_selected": dist_d if opt_mode == 1 else dist_alt,  # GT distance of the chosen mode
             })
     return records, ambiguous_tracks
 
@@ -187,6 +188,7 @@ def summarize_modes(records: list[dict], tau: float) -> dict:
     gt = np.array([r["gt_mode"] for r in records])
     gap = np.array([r["gap"] for r in records])
     best = np.array([r["dist_best"] for r in records])
+    selected = np.array([r["dist_selected"] for r in records])
     correct = opt == gt
     mode2 = opt == 2
     return {
@@ -197,6 +199,8 @@ def summarize_modes(records: list[dict], tau: float) -> dict:
         "primary_correct_frac": float((gt == 1).mean()),           # always-pick-primary baseline
         "bimodal_over_primary": float(correct.mean() - (gt == 1).mean()),
         "oracle_within_tau_frac": float((best < tau).mean()),      # is a GT-accurate hypothesis even present
+        "selection_cost_mean_m": float((selected - best).mean()),  # GT-distance lost to wrong mode choices
+        "dist_selected_median_m": float(np.median(selected)),      # chosen surface's distance to GT
         "gap_median": float(np.median(gap)),
     }
 
