@@ -51,7 +51,9 @@ mkdir -p $OUT
 # mode jobs for the same scene don't clobber each other.
 if [ ! -f "$GT" ]; then
     echo "=== [0] Building GT cloud from scans -> $GT ==="
-    TMP="$GT.tmp.$SLURM_JOB_ID"
+    # Temp must keep a .ply extension (Open3D infers the writer from it); atomic mv so
+    # concurrent mode jobs for the same scene don't clobber each other.
+    TMP="$DATA/$SEQ/.${SEQ}_gt.tmp.$SLURM_JOB_ID.ply"
     uv run python scripts/eth3d_merge_scans.py \
         "$DATA/$SEQ/scan_clean/scan_alignment.mlp" --out "$TMP" --voxel 0.01
     mv -n "$TMP" "$GT" || true
