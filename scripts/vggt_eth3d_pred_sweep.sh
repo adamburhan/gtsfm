@@ -2,8 +2,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
-#SBATCH --gres=gpu:1
-#SBATCH --constraint=ampere|lovelace|hopper
+#SBATCH --gres=gpu:a100l:1
 #SBATCH --time=06:00:00
 
 # VGGT ETH3D depth-factor sweep: one (sequence, depth_model) per job.
@@ -26,7 +25,12 @@ GAPTHRESH=${4:-0.10}
 project_name="gtsfm"
 project_root="$HOME/repos/$project_name"
 DATA="$SCRATCH/datasets/eth3d"
-OUT="$SCRATCH/logs/cluv/$SLURM_JOB_ID/${SEQ}_${MODE}_${GAPTHRESH}"
+# Sweep root groups runs as <root>/<seq>/<mode> so `aggregate_modes.py --root` discovers
+# them directly. Gap is folded into the default root name (one gap per aggregatable root,
+# since the aggregator has no gap dimension); override SWEEP_NAME to share a root across
+# manual submissions.
+SWEEP=${SWEEP_NAME:-eth3d_g${GAPTHRESH}}
+OUT="$SCRATCH/logs/sweeps/${SWEEP}/${SEQ}/${MODE}"
 GT="$DATA/$SEQ/${SEQ}_gt.ply"
 
 echo "GIT_COMMIT=${GIT_COMMIT:?GIT_COMMIT is not set. Use 'cluv submit' to submit this job script.}"
@@ -107,5 +111,17 @@ uv run python scripts/gaussian_splatting/custom_trainer.py default \
     --init_type sfm \
     --max_steps $GS_STEPS \
     --result_dir $OUT/gs
+
+echo "=== Curating outputs (keep metrics + reconstruction + figures; drop multi-GB artifacts) ==="
+# GS checkpoints/ply/renders are ~850MB/run and regenerable; keep only the NVS stats JSON
+# that aggregation reads. Set KEEP_GS_ARTIFACTS=1 to retain them (e.g. for paper figures).
+if [ "${KEEP_GS_ARTIFACTS:-0}" != "1" ]; then
+    find "$OUT/gs" -mindepth 1 -maxdepth 1 ! -name stats -exec rm -rf {} + 2>/dev/null || true
+fi
+# Debug image dumps (not used downstream).
+rm -rf "$OUT/results/processed_images"
+# results/depth.npz (~18MB) is kept by default: it lets you re-run eval_geometry at other
+# gap_thresh values without re-running VGGT. Set DROP_DEPTH_NPZ=1 to remove it.
+[ "${DROP_DEPTH_NPZ:-0}" = "1" ] && rm -f "$OUT/results/depth.npz"
 
 echo "Done. Results in $OUT"

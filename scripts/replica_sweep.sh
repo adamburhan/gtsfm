@@ -2,8 +2,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --gres=gpu:1
-#SBATCH --constraint=ampere|lovelace|hopper
+#SBATCH --gres=gpu:a100l:1
 #SBATCH --time=06:00:00
 
 # Replica depth-factor sweep: one (sequence, depth_model) per job.

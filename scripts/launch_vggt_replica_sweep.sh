@@ -4,16 +4,15 @@ set -e
 
 STRIDE=10
 GS_STEPS=7000
-GAP_THRESHOLDS="0.05 0.10 0.15"
+GAP_THRESHOLDS="0.10"
 
-for SEQ in office0 office1 office2 office3 office4 room0 room1 room2; do
-    for MODE in none unimodal drop_ambiguous bimodal; do
-        if [ "$MODE" = "none" ] || [ "$MODE" = "unimodal" ]; then
-            cluv submit mila scripts/vggt_replica_sweep.sh -- $SEQ $MODE $STRIDE $GS_STEPS 0.0
-        else
-            for GAP in $GAP_THRESHOLDS; do
-                cluv submit mila scripts/vggt_replica_sweep.sh -- $SEQ $MODE $STRIDE $GS_STEPS $GAP
-            done
-        fi
+sequences="office0 office1 office2 office3 office4 room0 room1 room2"
+
+# Each gap is its own aggregatable root ($SCRATCH/logs/sweeps/replica_g<gap>/<seq>/<mode>)
+for SEQ in $sequences; do
+    for GAP in $GAP_THRESHOLDS; do
+        for MODE in none unimodal drop_ambiguous bimodal; do
+            cluv submit mila scripts/vggt_replica_sweep.sh -- $SEQ $MODE $STRIDE $GS_STEPS $GAP
+        done
     done
 done
