@@ -28,6 +28,12 @@ import pandas as pd
 
 MODE_ORDER = ["none", "unimodal", "drop_ambiguous", "bimodal"]
 POSE_KEYS = ["pose_auc_@1.0_deg", "pose_auc_@2.5_deg", "pose_auc_@5.0_deg"]
+# Pose metrics live in different files per pipeline; prefer the merged/final one.
+POSE_FILES = [
+    ("merging_metrics.json", "merging_metrics"),
+    ("cluster_vggt_metrics.json", "cluster_vggt_metrics"),
+    ("bundle_adjustment_metrics.json", "bundle_adjustment_metrics"),
+]
 NVS_KEYS = ["psnr", "ssim", "lpips", "num_GS"]
 MODE_KEYS = [
     "n_ambiguous_measurements", "mode2_selected_frac", "mode_correct_frac", "mode2_correct_frac",
@@ -68,12 +74,14 @@ def collect(run_dir: Path) -> dict:
         rec["amb_n_points"] = amb.get("n_points")
         rec["amb_accuracy_median_m"] = amb.get("accuracy_median_m")
         rec.update({k: geom.get("modes", {}).get(k) for k in MODE_KEYS})
-    b = _find(run_dir, "bundle_adjustment_metrics.json")
-    if b:
-        ba = json.loads(b.read_text())["bundle_adjustment_metrics"]
-        rec.update({k: ba.get(k) for k in POSE_KEYS})
-        rec["rot_err_median_deg"] = _median(ba.get("rotation_angle_error_deg"))
-        rec["trans_err_median"] = _median(ba.get("translation_error_distance"))
+    for fname, wrapper in POSE_FILES:
+        b = _find(run_dir, fname)
+        if b:
+            ba = json.loads(b.read_text())[wrapper]
+            rec.update({k: ba.get(k) for k in POSE_KEYS})
+            rec["rot_err_median_deg"] = _median(ba.get("rotation_angle_error_deg"))
+            rec["trans_err_median"] = _median(ba.get("translation_error_distance"))
+            break
     vals = sorted(run_dir.rglob("val_step*.json"), key=lambda p: int(re.search(r"(\d+)", p.stem).group(1)))
     if vals:
         gs = json.loads(vals[-1].read_text())
