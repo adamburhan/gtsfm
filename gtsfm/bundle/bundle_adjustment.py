@@ -146,6 +146,35 @@ def make_bimodal_depth_factor(pose_key: int, lm_key: int, d: float, d_alt: float
     return gtsam.CustomFactor(noise, [pose_key, lm_key], error_func)
 
 
+def make_mixture_depth_factor(pose_key, lm_key, depths, sigmas, log_weights, noise) -> "gtsam.CustomFactor":
+    """Weighted, per-mode-sigma max-mixture depth factor (N>=1 modes, no gating).
+
+    Picks the component minimizing ``0.5*(r/sigma)^2 + log(sigma) - log(weight)`` and returns the
+    sigma-whitened residual under a *unit* ``noise`` model. One mode → a plain depth factor; two
+    modes with equal sigma/weight → the old min-|r| bimodal factor. So treating a unimodal pixel as
+    two near-identical modes is a no-op, and every measurement can use this.
+    """
+    depths = np.asarray(depths, dtype=np.float64)
+    sigmas = np.asarray(sigmas, dtype=np.float64)
+    log_weights = np.asarray(log_weights, dtype=np.float64)
+
+    def error_func(this, values, H):
+        pose_wTc = values.atPose3(pose_key)
+        point_w = values.atPoint3(lm_key)
+        H_pose = np.zeros((3, 6), dtype=np.float64, order="F")
+        H_point = np.zeros((3, 3), dtype=np.float64, order="F")
+        point_c = pose_wTc.transformTo(point_w, H_pose, H_point)
+        z_pred = float(point_c[2])
+        r = (z_pred - depths) / sigmas
+        k = int(np.argmin(0.5 * r * r + np.log(sigmas) - log_weights))
+        if H is not None:
+            H[0] = H_pose[2:3, :] / sigmas[k]
+            H[1] = H_point[2:3, :] / sigmas[k]
+        return np.array([r[k]], dtype=np.float64)
+
+    return gtsam.CustomFactor(noise, [pose_key, lm_key], error_func)
+
+
 def multi_view_retriangulate_from_2d_tracks(
     gtsfm_data: GtsfmData,
     tracks_2d: List["SfmTrack2d"],
@@ -607,8 +636,10 @@ class BundleAdjustmentOptimizer:
             return graph
 
         depth_noise = Isotropic.Sigma(1, self._depth_factor_sigma)
+        unit_noise = Isotropic.Sigma(1, 1.0)  # mixture factor whitens by its own per-mode sigma
         if self._depth_factor_robust_loss:
             depth_noise = Robust(mEstimator.Huber(self._robust_noise_basin), depth_noise)
+            unit_noise = Robust(mEstimator.Huber(self._robust_noise_basin), unit_noise)
 
         n_unimodal = 0
         n_bimodal = 0
@@ -626,6 +657,20 @@ class BundleAdjustmentOptimizer:
                 sample = depth_provider.get_depth(i, float(uv[0]), float(uv[1]))
                 if sample is None:
                     n_skipped += 1
+                    continue
+                if sample.is_mixture:
+                    # MDA modes: always a weighted, per-mode-sigma mixture factor (no gating).
+                    base = self._depth_factor_sigma
+                    graph.push_back(
+                        make_mixture_depth_factor(
+                            X(i), P(j),
+                            [sample.depth, sample.depth_alt],
+                            [float(np.hypot(base, sample.sigma)), float(np.hypot(base, sample.sigma_alt))],
+                            [sample.log_weight, sample.log_weight_alt],
+                            unit_noise,
+                        )
+                    )
+                    n_bimodal += 1
                     continue
                 if sample.ambiguous and self._depth_model == DepthFactorMode.DROP_AMBIGUOUS:
                     n_dropped_ambiguous += 1

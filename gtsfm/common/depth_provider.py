@@ -43,6 +43,12 @@ class DepthSample(NamedTuple):
     depth_alt: Optional[float]
     ambiguous: bool
     score: float
+    # Mixture extras (set by MdaDepthProvider; default 0/False keeps the patch provider unchanged).
+    sigma: float = 0.0           # per-mode sigma in depth units; 0 -> use the BA base sigma
+    sigma_alt: float = 0.0
+    log_weight: float = 0.0      # log mixing weight of the primary mode
+    log_weight_alt: float = 0.0
+    is_mixture: bool = False     # True -> always emit a weighted max-mixture factor (no gating)
 
 
 class DepthProvider:
@@ -269,19 +275,27 @@ class MdaDepthProvider:
         return float(s), float(t)
 
     def _collapse(self, means, logw):
-        """K experts -> (primary, alt, ambiguous) via the largest depth gap (two surfaces)."""
+        """K experts -> two surfaces via the largest depth gap (always two modes, no gating).
+
+        Returns (primary, alt, log_w_primary, log_w_alt, ambiguous); primary = dominant-weight
+        surface. When the experts cluster (small gap) the two modes are near-identical, so the
+        mixture factor behaves unimodally — that's why no gate is needed.
+        """
         w = np.exp(logw - logw.max())
         w /= w.sum()
         order = np.argsort(means)
         ms, ws = means[order], w[order]
         k = int(np.argmax(np.diff(ms)))
-        if ms[k + 1] - ms[k] < self._gap:
-            return float(means[np.argmax(w)]), None, False
-        wn, wf = ws[: k + 1].sum(), ws[k + 1 :].sum()
+        gap = float(ms[k + 1] - ms[k])
+        wn, wf = float(ws[: k + 1].sum()), float(ws[k + 1 :].sum())
         near = float((ms[: k + 1] * ws[: k + 1]).sum() / wn)
         far = float((ms[k + 1 :] * ws[k + 1 :]).sum() / wf)
-        primary, alt = (near, far) if wn >= wf else (far, near)
-        return primary, alt, bool(min(wn, wf) > self._w_min)
+        if wn >= wf:
+            primary, alt, lw_p, lw_a = near, far, wn, wf
+        else:
+            primary, alt, lw_p, lw_a = far, near, wf, wn
+        ambiguous = bool(gap >= self._gap and min(wn, wf) > self._w_min)  # informational (metrics)
+        return primary, alt, float(np.log(lw_p + 1e-12)), float(np.log(lw_a + 1e-12)), ambiguous
 
     def get_depth(self, image_id: int, u: float, v: float) -> Optional[DepthSample]:
         means = self._means.get(image_id)
@@ -292,12 +306,15 @@ class MdaDepthProvider:
         row = int(round(v)) - self._crop_top.get(image_id, 0)
         if not (0 <= row < h and 0 <= col < w):
             return None
-        primary, alt, ambiguous = self._collapse(means[:, row, col], self._logw[image_id][row, col])
+        primary, alt, lw_p, lw_a, ambiguous = self._collapse(means[:, row, col], self._logw[image_id][row, col])
         if not (self._dmin <= primary <= self._dmax):
             return None
         return DepthSample(
             depth=primary,
-            depth_alt=alt if ambiguous else None,
+            depth_alt=alt,
             ambiguous=ambiguous,
-            score=abs(primary - alt) if alt is not None else 0.0,
+            score=abs(primary - alt),
+            log_weight=lw_p,
+            log_weight_alt=lw_a,
+            is_mixture=True,  # always a 2-mode weighted mixture factor; sigma left 0 -> BA base sigma
         )
