@@ -302,6 +302,7 @@ class BundleAdjustmentOptions:
     depth_ambiguity_thresh: float = 0.20
     depth_min_valid: int = 10
     depth_mda_dir: Optional[str] = None  # precomputed MDA mixtures (dump_mda_mixture); overrides patch modes
+    depth_mda_sigma_rel: float = 0.05    # MDA mixture sigma RELATIVE to depth (sigma = rel*depth); scale-invariant
 
     def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
         """Construct a :class:`BundleAdjustmentOptimizer` from these options.
@@ -341,6 +342,7 @@ class BundleAdjustmentOptions:
             depth_ambiguity_thresh=self.depth_ambiguity_thresh,
             depth_min_valid=self.depth_min_valid,
             depth_mda_dir=self.depth_mda_dir,
+            depth_mda_sigma_rel=self.depth_mda_sigma_rel,
         )
         kwargs.update(overrides)
         return BundleAdjustmentOptimizer(**kwargs)
@@ -406,6 +408,7 @@ class BundleAdjustmentOptimizer:
         depth_ambiguity_thresh: float = 0.20,
         depth_min_valid: int = 10,
         depth_mda_dir: Optional[str] = None,
+        depth_mda_sigma_rel: float = 0.05,
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -498,6 +501,7 @@ class BundleAdjustmentOptimizer:
         self._depth_ambiguity_thresh = depth_ambiguity_thresh
         self._depth_min_valid = depth_min_valid
         self._depth_mda_dir = depth_mda_dir
+        self._depth_mda_sigma_rel = depth_mda_sigma_rel
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
@@ -659,14 +663,18 @@ class BundleAdjustmentOptimizer:
                     n_skipped += 1
                     continue
                 if sample.is_mixture:
-                    # MDA modes: always a weighted, per-mode-sigma mixture factor (no gating).
-                    # sample.sigma is a conf-derived multiplier of the base sigma (1.0 if unset).
-                    base = self._depth_factor_sigma
+                    # MDA modes: weighted, per-mode-sigma mixture factor (no gating).
+                    # Scale-invariant noise: sigma is RELATIVE to the mode depth (sigma = rel*depth),
+                    # times the conf-derived multiplier. Like a fixed pixel sigma, this auto-adapts to
+                    # scene scale instead of a fixed absolute sigma that mis-scales across scenes.
+                    rel = self._depth_mda_sigma_rel
+                    s_p = rel * max(sample.depth, 1e-3) * (sample.sigma or 1.0)
+                    s_a = rel * max(sample.depth_alt, 1e-3) * (sample.sigma_alt or 1.0)
                     graph.push_back(
                         make_mixture_depth_factor(
                             X(i), P(j),
                             [sample.depth, sample.depth_alt],
-                            [base * (sample.sigma or 1.0), base * (sample.sigma_alt or 1.0)],
+                            [s_p, s_a],
                             [sample.log_weight, sample.log_weight_alt],
                             unit_noise,
                         )
