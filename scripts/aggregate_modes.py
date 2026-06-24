@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pandas as pd
 
-MODE_ORDER = ["none", "unimodal", "drop_ambiguous", "bimodal"]
+MODE_ORDER = ["none", "unimodal", "drop_ambiguous", "bimodal", "bimodal_mda"]
 POSE_KEYS = ["pose_auc_@1.0_deg", "pose_auc_@2.5_deg", "pose_auc_@5.0_deg"]
 # Pose metrics live in different files per pipeline; prefer the merged/final one.
 POSE_FILES = [

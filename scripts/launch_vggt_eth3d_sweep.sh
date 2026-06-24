@@ -4,15 +4,16 @@
 set -e
 
 GS_STEPS=7000
-GAP_THRESHOLDS="0.10"
+GAP="0.10"
 
-sequences="courtyard delivery_area electro facade kicker meadow office pipes playground relief_2 relief terrace terrains"
+# v1 MDA comparison: only the single-cluster scenes that already have precomputed MDA mixtures
+# at $SCRATCH/mda_mixture/<seq>_mda. Conditions: none vs bimodal (VGGT depth + patch) vs
+# bimodal_mda (MDA mixture modes). Same settings; differ only in the depth source.
+sequences="kicker office pipes relief terrace delivery_area"
 
-# Each gap is its own aggregatable root ($SCRATCH/logs/sweeps/eth3d_g<gap>/<seq>/<mode>)
+# Root: $SCRATCH/logs/sweeps/eth3d_g0.10/<seq>/<mode>
 for SEQ in $sequences; do
-    for GAP in $GAP_THRESHOLDS; do
-        for MODE in none unimodal drop_ambiguous bimodal; do
-            cluv submit mila scripts/vggt_eth3d_pred_sweep.sh -- $SEQ $MODE $GS_STEPS $GAP
-        done
+    for MODE in none bimodal bimodal_mda; do
+        cluv submit mila scripts/vggt_eth3d_pred_sweep.sh -- $SEQ $MODE $GS_STEPS $GAP
     done
 done

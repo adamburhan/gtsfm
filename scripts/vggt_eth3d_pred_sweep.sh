@@ -29,7 +29,7 @@ DATA="$SCRATCH/datasets/eth3d"
 # them directly. Gap is folded into the default root name (one gap per aggregatable root,
 # since the aggregator has no gap dimension); override SWEEP_NAME to share a root across
 # manual submissions.
-SWEEP=${SWEEP_NAME:-eth3d_g${GAPTHRESH}}
+SWEEP=${SWEEP_NAME:-eth3d_g${GAPTHRESH}_mda}
 OUT="$SCRATCH/logs/sweeps/${SWEEP}/${SEQ}/${MODE}"
 GT="$DATA/$SEQ/${SEQ}_gt.ply"
 
@@ -66,18 +66,31 @@ fi
 
 BA="cluster_optimizer.optimizer.ba_options"
 
-echo "=== [1/3] GTSfM VGGT: seq=$SEQ depth_model=$MODE gap_thresh=$GAPTHRESH ==="
+# Condition: none | unimodal | drop_ambiguous | bimodal (VGGT depth + patch) |
+#            bimodal_mda (MDA mixture modes). bimodal* use a robust depth factor; bimodal_mda
+#            additionally sources its modes from the precomputed MDA mixture for this scene.
+DEPTH_MODEL=$MODE
+DEPTH_ARGS=""
+case "$MODE" in
+    bimodal|bimodal_mda) DEPTH_MODEL=bimodal; DEPTH_ARGS="$BA.depth_factor_robust_loss=true" ;;
+esac
+if [ "$MODE" = "bimodal_mda" ]; then
+    DEPTH_ARGS="$DEPTH_ARGS $BA.depth_mda_dir=$SCRATCH/mda_mixture/${SEQ}_mda"
+fi
+
+echo "=== [1/3] GTSfM VGGT: seq=$SEQ mode=$MODE gap_thresh=$GAPTHRESH ==="
 uv run python -m gtsfm.runner \
     --config_name vggt_megaloc_eth3d.yaml \
     --output_root $OUT \
     --dask_tmpdir $SLURM_TMPDIR \
     --dataset_dir=$DATA/$SEQ/dslr_calibration_undistorted \
     --images_dir=$DATA/$SEQ/images \
-    $BA.depth_model=$MODE \
+    $BA.depth_model=$DEPTH_MODEL \
     $BA.use_gnc=false \
     $BA.depth_min=0.0 \
     $BA.depth_max=1e9 \
-    $BA.depth_gap_thresh=$GAPTHRESH
+    $BA.depth_gap_thresh=$GAPTHRESH \
+    $DEPTH_ARGS
 
 # Pick the reconstruction to evaluate: merged scene if the scene partitioned
 # (>1 cluster), otherwise the single-cluster vggt output. depth.npz (and thus the

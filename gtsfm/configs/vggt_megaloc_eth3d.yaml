@@ -64,6 +64,8 @@ cluster_optimizer:
       depth_min: 0.0
       depth_max: 1.0e9
       depth_gap_thresh: 0.15
+      depth_factor_robust_loss: false
+      depth_mda_dir: null   # set per scene to $SCRATCH/mda_mixture/<scene>_mda for MDA modes
 
     # --- VGGT operational params ---
     input_mode: crop
