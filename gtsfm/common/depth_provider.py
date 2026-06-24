@@ -218,8 +218,86 @@ class DepthProvider:
         min_side_count = 3
         ambiguous = max_gap >= self._gap_thresh and min(near.size, far.size) >= min_side_count
         return DepthSample(
-            depth=d_center, 
-            depth_alt=d_alt if ambiguous else None, 
-            ambiguous=ambiguous, 
+            depth=d_center,
+            depth_alt=d_alt if ambiguous else None,
+            ambiguous=ambiguous,
             score=score if ambiguous else 0.0
+        )
+
+
+class MdaDepthProvider:
+    """Depth source from precomputed MDA mixtures, aligned to in-memory VGGT depth.
+
+    Reads per-view MDA expert depths + log mixing weights (the ``dump_mda_mixture`` output),
+    fits a per-image scale+shift to the VGGT depth (MDA depth is affine), and collapses the K
+    experts at their largest gap into two bracketing surfaces. Same ``get_depth`` interface as
+    :class:`DepthProvider`, so it drops into the depth-factor path unchanged.
+
+    The MDA grid matches the VGGT depth grid up to a vertical ``crop_top`` (read from
+    ``original_coords.npy`` in ``mda_dir`` if present, else 0). v1 scope: single-cluster scenes,
+    so the camera index equals the sorted-filename mixture index.
+    """
+
+    def __init__(self, mda_dir, depth_arrays, *, depth_min, depth_max, gap_thresh, w_min=0.1):
+        self._dmin, self._dmax, self._gap, self._w_min = depth_min, depth_max, gap_thresh, w_min
+        mda_dir = Path(mda_dir)
+        coords_path = mda_dir / "original_coords.npy"
+        coords = np.load(coords_path) if coords_path.exists() else None
+        self._means: Dict[int, np.ndarray] = {}
+        self._logw: Dict[int, np.ndarray] = {}
+        self._crop_top: Dict[int, int] = {}
+        for i, f in enumerate(sorted(mda_dir.glob("?" * 6 + ".npz"))):
+            z = np.load(f)
+            ct = int(round(coords[i, 1])) if coords is not None else 0
+            ref = depth_arrays.get(i) if depth_arrays else None
+            s, t = self._fit_scale_shift(z["decoded"].astype(np.float64), ref, ct)
+            self._means[i] = z["means"].astype(np.float64) * s + t   # (K, h, w), recon scale
+            self._logw[i] = z["logw"].astype(np.float64)             # (h, w, K)
+            self._crop_top[i] = ct
+
+    def _fit_scale_shift(self, decoded, vggt, crop_top):
+        """Per-image (scale, shift) mapping MDA decoded depth -> recon-scale VGGT depth."""
+        if vggt is None:
+            return 1.0, 0.0
+        h, w = decoded.shape
+        ref = vggt[crop_top : crop_top + h, :w]
+        m = np.isfinite(decoded) & np.isfinite(ref) & (ref > self._dmin) & (ref < self._dmax)
+        if int(m.sum()) < 100:
+            return 1.0, 0.0
+        a = np.stack([decoded[m], np.ones(int(m.sum()))], axis=1)
+        (s, t), *_ = np.linalg.lstsq(a, ref[m], rcond=None)
+        return float(s), float(t)
+
+    def _collapse(self, means, logw):
+        """K experts -> (primary, alt, ambiguous) via the largest depth gap (two surfaces)."""
+        w = np.exp(logw - logw.max())
+        w /= w.sum()
+        order = np.argsort(means)
+        ms, ws = means[order], w[order]
+        k = int(np.argmax(np.diff(ms)))
+        if ms[k + 1] - ms[k] < self._gap:
+            return float(means[np.argmax(w)]), None, False
+        wn, wf = ws[: k + 1].sum(), ws[k + 1 :].sum()
+        near = float((ms[: k + 1] * ws[: k + 1]).sum() / wn)
+        far = float((ms[k + 1 :] * ws[k + 1 :]).sum() / wf)
+        primary, alt = (near, far) if wn >= wf else (far, near)
+        return primary, alt, bool(min(wn, wf) > self._w_min)
+
+    def get_depth(self, image_id: int, u: float, v: float) -> Optional[DepthSample]:
+        means = self._means.get(image_id)
+        if means is None:
+            return None
+        h, w = means.shape[1], means.shape[2]
+        col = int(round(u))
+        row = int(round(v)) - self._crop_top.get(image_id, 0)
+        if not (0 <= row < h and 0 <= col < w):
+            return None
+        primary, alt, ambiguous = self._collapse(means[:, row, col], self._logw[image_id][row, col])
+        if not (self._dmin <= primary <= self._dmax):
+            return None
+        return DepthSample(
+            depth=primary,
+            depth_alt=alt if ambiguous else None,
+            ambiguous=ambiguous,
+            score=abs(primary - alt) if alt is not None else 0.0,
         )

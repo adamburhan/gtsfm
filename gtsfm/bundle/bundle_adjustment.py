@@ -24,7 +24,7 @@ import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metrics_utils
 import gtsfm.utils.tracks as track_utils
 from gtsfm.common import gtsfm_data
-from gtsfm.common.depth_provider import DepthProvider
+from gtsfm.common.depth_provider import DepthProvider, MdaDepthProvider
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.common.pose_prior import PosePrior
 from gtsfm.common.sfm_track import SfmTrack2d
@@ -272,6 +272,7 @@ class BundleAdjustmentOptions:
     depth_gap_thresh: float = 0.15
     depth_ambiguity_thresh: float = 0.20
     depth_min_valid: int = 10
+    depth_mda_dir: Optional[str] = None  # precomputed MDA mixtures (dump_mda_mixture); overrides patch modes
 
     def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
         """Construct a :class:`BundleAdjustmentOptimizer` from these options.
@@ -310,6 +311,7 @@ class BundleAdjustmentOptions:
             depth_gap_thresh=self.depth_gap_thresh,
             depth_ambiguity_thresh=self.depth_ambiguity_thresh,
             depth_min_valid=self.depth_min_valid,
+            depth_mda_dir=self.depth_mda_dir,
         )
         kwargs.update(overrides)
         return BundleAdjustmentOptimizer(**kwargs)
@@ -374,6 +376,7 @@ class BundleAdjustmentOptimizer:
         depth_gap_thresh: float = 0.15,
         depth_ambiguity_thresh: float = 0.20,
         depth_min_valid: int = 10,
+        depth_mda_dir: Optional[str] = None,
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -465,6 +468,7 @@ class BundleAdjustmentOptimizer:
         self._depth_gap_thresh = depth_gap_thresh
         self._depth_ambiguity_thresh = depth_ambiguity_thresh
         self._depth_min_valid = depth_min_valid
+        self._depth_mda_dir = depth_mda_dir
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
@@ -543,7 +547,16 @@ class BundleAdjustmentOptimizer:
         if self._depth_provider is not None:
             return self._depth_provider
         compute_hypotheses = self._depth_model in (DepthFactorMode.DROP_AMBIGUOUS, DepthFactorMode.BIMODAL)
-        if self._depth_arrays is not None:
+        if self._depth_mda_dir is not None:
+            # MDA mixture modes, aligned per-image to the in-memory VGGT depth (the affine fix).
+            self._depth_provider = MdaDepthProvider(
+                self._depth_mda_dir,
+                self._depth_arrays,
+                depth_min=self._depth_min,
+                depth_max=self._depth_max,
+                gap_thresh=self._depth_gap_thresh,
+            )
+        elif self._depth_arrays is not None:
             # In-memory depth keyed by image index; no filenames or scaling needed.
             self._depth_provider = DepthProvider(
                 depth_arrays=self._depth_arrays,
