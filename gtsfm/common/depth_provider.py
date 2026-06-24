@@ -244,13 +244,17 @@ class MdaDepthProvider:
     so the camera index equals the sorted-filename mixture index.
     """
 
-    def __init__(self, mda_dir, depth_arrays, *, depth_min, depth_max, gap_thresh, w_min=0.1):
+    def __init__(self, mda_dir, depth_arrays, *, depth_min, depth_max, gap_thresh, w_min=0.1,
+                 sigma_lo=0.33, sigma_hi=3.0):
         self._dmin, self._dmax, self._gap, self._w_min = depth_min, depth_max, gap_thresh, w_min
+        self._sig_lo, self._sig_hi = sigma_lo, sigma_hi  # clamp on the conf-derived sigma multiplier
         mda_dir = Path(mda_dir)
         coords_path = mda_dir / "original_coords.npy"
         coords = np.load(coords_path) if coords_path.exists() else None
         self._means: Dict[int, np.ndarray] = {}
         self._logw: Dict[int, np.ndarray] = {}
+        self._conf: Dict[int, np.ndarray] = {}
+        self._conf_ref: Dict[int, float] = {}
         self._crop_top: Dict[int, int] = {}
         for i, f in enumerate(sorted(mda_dir.glob("?" * 6 + ".npz"))):
             z = np.load(f)
@@ -259,6 +263,8 @@ class MdaDepthProvider:
             s, t = self._fit_scale_shift(z["decoded"].astype(np.float64), ref, ct)
             self._means[i] = z["means"].astype(np.float64) * s + t   # (K, h, w), recon scale
             self._logw[i] = z["logw"].astype(np.float64)             # (h, w, K)
+            self._conf[i] = z["conf"].astype(np.float64)             # (K, h, w) per-expert precision
+            self._conf_ref[i] = float(np.median(self._conf[i]) + 1e-12)  # per-image conf scale
             self._crop_top[i] = ct
 
     def _fit_scale_shift(self, decoded, vggt, crop_top):
@@ -274,28 +280,36 @@ class MdaDepthProvider:
         (s, t), *_ = np.linalg.lstsq(a, ref[m], rcond=None)
         return float(s), float(t)
 
-    def _collapse(self, means, logw):
+    def _collapse(self, means, logw, conf, conf_ref):
         """K experts -> two surfaces via the largest depth gap (always two modes, no gating).
 
-        Returns (primary, alt, log_w_primary, log_w_alt, ambiguous); primary = dominant-weight
-        surface. When the experts cluster (small gap) the two modes are near-identical, so the
-        mixture factor behaves unimodally — that's why no gate is needed.
+        Returns (primary, alt, log_w_primary, log_w_alt, sigma_primary, sigma_alt, ambiguous);
+        primary = dominant-weight surface. The per-mode sigma is a multiplier of the BA base sigma
+        derived from MDA conf: a low-confidence mode (conf << image median) gets a larger sigma,
+        so the depth factor pulls it weakly. Clamped to [sigma_lo, sigma_hi].
         """
         w = np.exp(logw - logw.max())
         w /= w.sum()
         order = np.argsort(means)
-        ms, ws = means[order], w[order]
+        ms, ws, cs = means[order], w[order], conf[order]
         k = int(np.argmax(np.diff(ms)))
         gap = float(ms[k + 1] - ms[k])
-        wn, wf = float(ws[: k + 1].sum()), float(ws[k + 1 :].sum())
-        near = float((ms[: k + 1] * ws[: k + 1]).sum() / wn)
-        far = float((ms[k + 1 :] * ws[k + 1 :]).sum() / wf)
+
+        def group(sl):
+            tot = float(ws[sl].sum())
+            depth = float((ms[sl] * ws[sl]).sum() / tot)
+            c = float((cs[sl] * ws[sl]).sum() / tot)
+            sigma = float(np.clip(conf_ref / (c + 1e-12), self._sig_lo, self._sig_hi))
+            return depth, sigma, tot
+
+        near, near_s, wn = group(slice(0, k + 1))
+        far, far_s, wf = group(slice(k + 1, None))
         if wn >= wf:
-            primary, alt, lw_p, lw_a = near, far, wn, wf
+            primary, alt, lw_p, lw_a, s_p, s_a = near, far, wn, wf, near_s, far_s
         else:
-            primary, alt, lw_p, lw_a = far, near, wf, wn
+            primary, alt, lw_p, lw_a, s_p, s_a = far, near, wf, wn, far_s, near_s
         ambiguous = bool(gap >= self._gap and min(wn, wf) > self._w_min)  # informational (metrics)
-        return primary, alt, float(np.log(lw_p + 1e-12)), float(np.log(lw_a + 1e-12)), ambiguous
+        return primary, alt, float(np.log(lw_p + 1e-12)), float(np.log(lw_a + 1e-12)), s_p, s_a, ambiguous
 
     def get_depth(self, image_id: int, u: float, v: float) -> Optional[DepthSample]:
         means = self._means.get(image_id)
@@ -306,7 +320,10 @@ class MdaDepthProvider:
         row = int(round(v)) - self._crop_top.get(image_id, 0)
         if not (0 <= row < h and 0 <= col < w):
             return None
-        primary, alt, lw_p, lw_a, ambiguous = self._collapse(means[:, row, col], self._logw[image_id][row, col])
+        primary, alt, lw_p, lw_a, s_p, s_a, ambiguous = self._collapse(
+            means[:, row, col], self._logw[image_id][row, col],
+            self._conf[image_id][:, row, col], self._conf_ref[image_id],
+        )
         if not (self._dmin <= primary <= self._dmax):
             return None
         return DepthSample(
@@ -314,7 +331,9 @@ class MdaDepthProvider:
             depth_alt=alt,
             ambiguous=ambiguous,
             score=abs(primary - alt),
+            sigma=s_p,           # multiplier of the BA base sigma (conf-derived)
+            sigma_alt=s_a,
             log_weight=lw_p,
             log_weight_alt=lw_a,
-            is_mixture=True,  # always a 2-mode weighted mixture factor; sigma left 0 -> BA base sigma
+            is_mixture=True,
         )

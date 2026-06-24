@@ -660,12 +660,13 @@ class BundleAdjustmentOptimizer:
                     continue
                 if sample.is_mixture:
                     # MDA modes: always a weighted, per-mode-sigma mixture factor (no gating).
+                    # sample.sigma is a conf-derived multiplier of the base sigma (1.0 if unset).
                     base = self._depth_factor_sigma
                     graph.push_back(
                         make_mixture_depth_factor(
                             X(i), P(j),
                             [sample.depth, sample.depth_alt],
-                            [float(np.hypot(base, sample.sigma)), float(np.hypot(base, sample.sigma_alt))],
+                            [base * (sample.sigma or 1.0), base * (sample.sigma_alt or 1.0)],
                             [sample.log_weight, sample.log_weight_alt],
                             unit_noise,
                         )
