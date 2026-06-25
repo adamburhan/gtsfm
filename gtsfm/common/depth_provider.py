@@ -46,8 +46,11 @@ class DepthSample(NamedTuple):
     # Mixture extras (set by MdaDepthProvider; default 0/False keeps the patch provider unchanged).
     sigma: float = 0.0           # per-mode sigma in depth units; 0 -> use the BA base sigma
     sigma_alt: float = 0.0
-    log_weight: float = 0.0      # log mixing weight of the primary mode
+    log_weight: float = 0.0      # log prior weight of the primary mode
     log_weight_alt: float = 0.0
+    depths: tuple = ()           # all K mode depths (recon scale), near->far; the mixture-factor input
+    sigmas: tuple = ()           # per-mode recon-unit sigma (pre-rel), aligned with `depths`
+    log_weights: tuple = ()      # per-mode log prior weight (near prior; NOT MDA mog_weight)
     is_mixture: bool = False     # True -> always emit a weighted max-mixture factor (no gating)
 
 
@@ -234,10 +237,11 @@ class DepthProvider:
 class MdaDepthProvider:
     """Depth source from precomputed MDA mixtures, aligned to in-memory VGGT depth.
 
-    Reads per-view MDA expert depths + log mixing weights (the ``dump_mda_mixture`` output),
-    fits a per-image scale+shift to the VGGT depth (MDA depth is affine), and collapses the K
-    experts at their largest gap into two bracketing surfaces. Same ``get_depth`` interface as
-    :class:`DepthProvider`, so it drops into the depth-factor path unchanged.
+    Reads per-view MDA expert depths + per-expert confidence (the ``dump_mda_mixture`` output)
+    and fits a per-image scale+shift to the VGGT depth (MDA depth is affine). ``get_depth``
+    returns all K experts as a mixture (per-mode conf-derived sigma + a slight near prior; the
+    mog mixing weights are not used). Same interface as :class:`DepthProvider`, so it drops into
+    the depth-factor path unchanged.
 
     The MDA grid matches the VGGT depth grid up to a vertical ``crop_top`` (read from
     ``original_coords.npy`` in ``mda_dir`` if present, else 0). v1 scope: single-cluster scenes,
@@ -245,16 +249,17 @@ class MdaDepthProvider:
     """
 
     def __init__(self, mda_dir, depth_arrays, *, depth_min, depth_max, gap_thresh, w_min=0.1,
-                 sigma_lo=0.33, sigma_hi=3.0):
+                 sigma_lo=0.33, sigma_hi=3.0, near_prior=0.3):
         self._dmin, self._dmax, self._gap, self._w_min = depth_min, depth_max, gap_thresh, w_min
         self._sig_lo, self._sig_hi = sigma_lo, sigma_hi  # clamp on the conf-derived sigma multiplier
+        self._near_prior = near_prior  # slight log-weight penalty per depth rank (nearer = preferred)
         mda_dir = Path(mda_dir)
         coords_path = mda_dir / "original_coords.npy"
         coords = np.load(coords_path) if coords_path.exists() else None
         self._means: Dict[int, np.ndarray] = {}
-        self._logw: Dict[int, np.ndarray] = {}
         self._conf: Dict[int, np.ndarray] = {}
         self._conf_ref: Dict[int, float] = {}
+        self._depth_ref: Dict[int, float] = {}
         self._crop_top: Dict[int, int] = {}
         for i, f in enumerate(sorted(mda_dir.glob("?" * 6 + ".npz"))):
             z = np.load(f)
@@ -262,9 +267,9 @@ class MdaDepthProvider:
             ref = depth_arrays.get(i) if depth_arrays else None
             s, t = self._fit_scale_shift(z["decoded"].astype(np.float64), ref, ct)
             self._means[i] = z["means"].astype(np.float64) * s + t   # (K, h, w), recon scale
-            self._logw[i] = z["logw"].astype(np.float64)             # (h, w, K)
             self._conf[i] = z["conf"].astype(np.float64)             # (K, h, w) per-expert precision
             self._conf_ref[i] = float(np.median(self._conf[i]) + 1e-12)  # per-image conf scale
+            self._depth_ref[i] = float(np.median(np.abs(self._means[i])) + 1e-9)  # per-image depth scale
             self._crop_top[i] = ct
 
     def _fit_scale_shift(self, decoded, vggt, crop_top):
@@ -280,38 +285,15 @@ class MdaDepthProvider:
         (s, t), *_ = np.linalg.lstsq(a, ref[m], rcond=None)
         return float(s), float(t)
 
-    def _collapse(self, means, logw, conf, conf_ref):
-        """K experts -> two surfaces via the largest depth gap (always two modes, no gating).
-
-        Returns (primary, alt, log_w_primary, log_w_alt, sigma_primary, sigma_alt, ambiguous);
-        primary = dominant-weight surface. The per-mode sigma is a multiplier of the BA base sigma
-        derived from MDA conf: a low-confidence mode (conf << image median) gets a larger sigma,
-        so the depth factor pulls it weakly. Clamped to [sigma_lo, sigma_hi].
-        """
-        w = np.exp(logw - logw.max())
-        w /= w.sum()
-        order = np.argsort(means)
-        ms, ws, cs = means[order], w[order], conf[order]
-        k = int(np.argmax(np.diff(ms)))
-        gap = float(ms[k + 1] - ms[k])
-
-        def group(sl):
-            tot = float(ws[sl].sum())
-            depth = float((ms[sl] * ws[sl]).sum() / tot)
-            c = float((cs[sl] * ws[sl]).sum() / tot)
-            sigma = float(np.clip(conf_ref / (c + 1e-12), self._sig_lo, self._sig_hi))
-            return depth, sigma, tot
-
-        near, near_s, wn = group(slice(0, k + 1))
-        far, far_s, wf = group(slice(k + 1, None))
-        if wn >= wf:
-            primary, alt, lw_p, lw_a, s_p, s_a = near, far, wn, wf, near_s, far_s
-        else:
-            primary, alt, lw_p, lw_a, s_p, s_a = far, near, wf, wn, far_s, near_s
-        ambiguous = bool(gap >= self._gap and min(wn, wf) > self._w_min)  # informational (metrics)
-        return primary, alt, float(np.log(lw_p + 1e-12)), float(np.log(lw_a + 1e-12)), s_p, s_a, ambiguous
-
     def get_depth(self, image_id: int, u: float, v: float) -> Optional[DepthSample]:
+        """All K MDA modes at (u,v): per-mode recon-scale depth + sigma + a slight near prior.
+
+        mog_weight is NOT used. Instead the log prior penalizes farther modes by ``near_prior`` per
+        depth rank (nearer preferred). Per-mode sigma (recon units, pre-rel) = conf multiplier x mode
+        depth, with depth floored to 0.1x the image median so a near-zero mode can't collapse sigma.
+        Behind-camera / out-of-range modes are dropped. The full mode list feeds the mixture factor;
+        depth/depth_alt (two nearest) are kept only for the eval diagnostic.
+        """
         means = self._means.get(image_id)
         if means is None:
             return None
@@ -320,20 +302,29 @@ class MdaDepthProvider:
         row = int(round(v)) - self._crop_top.get(image_id, 0)
         if not (0 <= row < h and 0 <= col < w):
             return None
-        primary, alt, lw_p, lw_a, s_p, s_a, ambiguous = self._collapse(
-            means[:, row, col], self._logw[image_id][row, col],
-            self._conf[image_id][:, row, col], self._conf_ref[image_id],
-        )
-        if not (self._dmin <= primary <= self._dmax):
+        mu = means[:, row, col]                                   # (K,) aligned mode depths
+        conf = self._conf[image_id][:, row, col]                  # (K,) per-mode precision
+        valid = (mu > 0.0) & (mu >= self._dmin) & (mu <= self._dmax)
+        if not valid.any():
             return None
+        mu, conf = mu[valid], conf[valid]
+        order = np.argsort(mu)                                    # near -> far
+        mu, conf = mu[order], conf[order]
+        ref, cref = self._depth_ref[image_id], self._conf_ref[image_id]
+        conf_mult = np.clip(cref / (conf + 1e-12), self._sig_lo, self._sig_hi)   # low conf -> larger sigma
+        sigmas = np.clip(mu, 0.1 * ref, 10.0 * ref) * conf_mult                  # recon-unit sigma (pre-rel)
+        log_weights = -self._near_prior * np.arange(len(mu), dtype=np.float64)   # slight near prior
         return DepthSample(
-            depth=primary,
-            depth_alt=alt,
-            ambiguous=ambiguous,
-            score=abs(primary - alt),
-            sigma=s_p,           # multiplier of the BA base sigma (conf-derived)
-            sigma_alt=s_a,
-            log_weight=lw_p,
-            log_weight_alt=lw_a,
+            depth=float(mu[0]),
+            depth_alt=float(mu[1]) if len(mu) > 1 else None,
+            ambiguous=bool(len(mu) > 1 and (mu[-1] - mu[0]) >= self._gap),
+            score=float(mu[-1] - mu[0]),
+            sigma=float(sigmas[0]),
+            sigma_alt=float(sigmas[1]) if len(mu) > 1 else 0.0,
+            log_weight=float(log_weights[0]),
+            log_weight_alt=float(log_weights[1]) if len(mu) > 1 else 0.0,
+            depths=tuple(float(x) for x in mu),
+            sigmas=tuple(float(x) for x in sigmas),
+            log_weights=tuple(float(x) for x in log_weights),
             is_mixture=True,
         )

@@ -303,6 +303,7 @@ class BundleAdjustmentOptions:
     depth_min_valid: int = 10
     depth_mda_dir: Optional[str] = None  # precomputed MDA mixtures (dump_mda_mixture); overrides patch modes
     depth_mda_sigma_rel: float = 0.05    # MDA mixture sigma RELATIVE to depth (sigma = rel*depth); scale-invariant
+    depth_mda_near_prior: float = 0.3    # slight log-weight penalty per depth rank (nearer mode preferred)
 
     def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
         """Construct a :class:`BundleAdjustmentOptimizer` from these options.
@@ -343,6 +344,7 @@ class BundleAdjustmentOptions:
             depth_min_valid=self.depth_min_valid,
             depth_mda_dir=self.depth_mda_dir,
             depth_mda_sigma_rel=self.depth_mda_sigma_rel,
+            depth_mda_near_prior=self.depth_mda_near_prior,
         )
         kwargs.update(overrides)
         return BundleAdjustmentOptimizer(**kwargs)
@@ -409,6 +411,7 @@ class BundleAdjustmentOptimizer:
         depth_min_valid: int = 10,
         depth_mda_dir: Optional[str] = None,
         depth_mda_sigma_rel: float = 0.05,
+        depth_mda_near_prior: float = 0.3,
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -502,6 +505,7 @@ class BundleAdjustmentOptimizer:
         self._depth_min_valid = depth_min_valid
         self._depth_mda_dir = depth_mda_dir
         self._depth_mda_sigma_rel = depth_mda_sigma_rel
+        self._depth_mda_near_prior = depth_mda_near_prior
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
@@ -588,6 +592,7 @@ class BundleAdjustmentOptimizer:
                 depth_min=self._depth_min,
                 depth_max=self._depth_max,
                 gap_thresh=self._depth_gap_thresh,
+                near_prior=self._depth_mda_near_prior,
             )
         elif self._depth_arrays is not None:
             # In-memory depth keyed by image index; no filenames or scaling needed.
@@ -663,19 +668,16 @@ class BundleAdjustmentOptimizer:
                     n_skipped += 1
                     continue
                 if sample.is_mixture:
-                    # MDA modes: weighted, per-mode-sigma mixture factor (no gating).
-                    # Scale-invariant noise: sigma is RELATIVE to the mode depth (sigma = rel*depth),
-                    # times the conf-derived multiplier. Like a fixed pixel sigma, this auto-adapts to
-                    # scene scale instead of a fixed absolute sigma that mis-scales across scenes.
+                    # All K MDA modes -> weighted max-mixture factor (no gating). Per-mode sigma is
+                    # RELATIVE to the mode depth (depth-floored x conf, then x rel) so it auto-adapts to
+                    # scene scale like a fixed pixel sigma. Weights are a slight near prior, not mog_weight.
                     rel = self._depth_mda_sigma_rel
-                    s_p = rel * max(sample.depth, 1e-3) * (sample.sigma or 1.0)
-                    s_a = rel * max(sample.depth_alt, 1e-3) * (sample.sigma_alt or 1.0)
                     graph.push_back(
                         make_mixture_depth_factor(
                             X(i), P(j),
-                            [sample.depth, sample.depth_alt],
-                            [s_p, s_a],
-                            [sample.log_weight, sample.log_weight_alt],
+                            list(sample.depths),
+                            [rel * s for s in sample.sigmas],
+                            list(sample.log_weights),
                             unit_noise,
                         )
                     )
