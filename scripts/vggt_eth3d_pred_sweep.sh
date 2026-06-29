@@ -18,10 +18,11 @@ set -eo pipefail
 module load cuda/12.6.0
 
 SEQ=${1:?usage: vggt_eth3d_pred_sweep.sh <sequence> <depth_model> [gs_max_steps] [gap_thresh]}
-MODE=${2:?mode: none | unimodal | drop_ambiguous | bimodal | bimodal_gap | bimodal_gmm | bimodal_mda}
+MODE=${2:?mode: none | unimodal | drop_ambiguous | bimodal | bimodal_gap | bimodal_gmm | bimodal_mda | bimodal_mda_null}
 GS_STEPS=${3:-7000}
 GAPTHRESH=${4:-0.10}
 HMETHOD=${HMETHOD:-gap}   # ambiguity analysis for VGGT-patch modes: gap | gmm (no effect on bimodal_mda)
+NULL_NSIGMA=${NULL_NSIGMA:-5}   # bimodal_mda_null: opt out of depth when best mode > this many sigmas off
 
 project_name="gtsfm"
 project_root="$HOME/repos/$project_name"
@@ -69,8 +70,9 @@ BA="cluster_optimizer.optimizer.ba_options"
 
 # Condition: none | unimodal | drop_ambiguous | bimodal (VGGT depth + patch) |
 #            bimodal_gap / bimodal_gmm (VGGT depth + patch, gap vs GMM ambiguity analysis) |
-#            bimodal_mda (MDA mixture modes). bimodal* use a robust depth factor; bimodal_mda
-#            additionally sources its modes from the precomputed MDA mixture for this scene.
+#            bimodal_mda (MDA mixture modes) | bimodal_mda_null (MDA modes + null hypothesis).
+# bimodal* use a robust depth factor; bimodal_mda* additionally source modes from the precomputed
+# MDA mixture for this scene; bimodal_mda_null adds the null-hypothesis opt-out (NULL_NSIGMA sigmas).
 # bimodal_gap/bimodal_gmm select the ambiguity analyzer explicitly; plain `bimodal` uses the
 # HMETHOD env default. All map to depth_model=bimodal; only the run-dir label differs.
 DEPTH_MODEL=$MODE
@@ -78,10 +80,13 @@ DEPTH_ARGS=""
 case "$MODE" in
     bimodal_gap) DEPTH_MODEL=bimodal; HMETHOD=gap; DEPTH_ARGS="$BA.depth_factor_robust_loss=true" ;;
     bimodal_gmm) DEPTH_MODEL=bimodal; HMETHOD=gmm; DEPTH_ARGS="$BA.depth_factor_robust_loss=true" ;;
-    bimodal|bimodal_mda) DEPTH_MODEL=bimodal; DEPTH_ARGS="$BA.depth_factor_robust_loss=true" ;;
+    bimodal|bimodal_mda|bimodal_mda_null) DEPTH_MODEL=bimodal; DEPTH_ARGS="$BA.depth_factor_robust_loss=true" ;;
 esac
-if [ "$MODE" = "bimodal_mda" ]; then
-    DEPTH_ARGS="$DEPTH_ARGS $BA.depth_mda_dir=$SCRATCH/mda_mixture/${SEQ}_mda"
+case "$MODE" in
+    bimodal_mda|bimodal_mda_null) DEPTH_ARGS="$DEPTH_ARGS $BA.depth_mda_dir=$SCRATCH/mda_mixture/${SEQ}_mda" ;;
+esac
+if [ "$MODE" = "bimodal_mda_null" ]; then
+    DEPTH_ARGS="$DEPTH_ARGS $BA.depth_null_nsigma=$NULL_NSIGMA"
 fi
 
 echo "=== [1/3] GTSfM VGGT: seq=$SEQ mode=$MODE gap_thresh=$GAPTHRESH ==="
