@@ -34,7 +34,7 @@ OUT="$SCRATCH/logs/sweeps/${SWEEP}/${SEQ}/${MODE}"
 GT="$DATA/$SEQ/${SEQ}_gt.ply"
 COLMAP_DIR="$DATA/$SEQ/dslr_calibration_undistorted"
 IMAGES_DIR="$DATA/$SEQ/images"
-DEPTH_DIR="$DATA/$SEQ/depth_pro"
+DEPTH_DIR="$DATA/$SEQ/depth_pro_760"
 
 echo "GIT_COMMIT=${GIT_COMMIT:?GIT_COMMIT is not set. Use 'cluv submit' to submit this job script.}"
 cd $SLURM_TMPDIR
