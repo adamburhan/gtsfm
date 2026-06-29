@@ -49,7 +49,7 @@ class DepthSample(NamedTuple):
     log_weight: float = 0.0      # log prior weight of the primary mode
     log_weight_alt: float = 0.0
     depths: tuple = ()           # all K mode depths (recon scale), near->far; the mixture-factor input
-    sigmas: tuple = ()           # per-mode recon-unit sigma (pre-rel), aligned with `depths`
+    sigmas: tuple = ()           # per-mode final sigma in depth units, aligned with `depths`
     log_weights: tuple = ()      # per-mode log prior weight (near prior; NOT MDA mog_weight)
     is_mixture: bool = False     # True -> always emit a weighted max-mixture factor (no gating)
 
@@ -78,10 +78,12 @@ class DepthProvider:
         depth_ext: str = ".png",
         depth_filename_template: Optional[str] = "depth{:06d}.png",
         compute_hypotheses: bool = False,
-        patch_radius: int = 5,
+        patch_radius: int = 3,
         gap_thresh: float = 0.15,
         ambiguity_thresh: float = 0.20,
         min_valid: int = 10,
+        hypothesis_method: str = "gap",
+        gmm_min_weight: float = 0.15,
     ) -> None:
         """
         Args:
@@ -132,6 +134,8 @@ class DepthProvider:
         self._gap_thresh = gap_thresh
         self._ambiguity_thresh = ambiguity_thresh
         self._min_valid = min_valid
+        self._hypothesis_method = hypothesis_method
+        self._gmm_min_weight = gmm_min_weight
         self._cache: Dict[int, Optional[np.ndarray]] = {}
 
     def _depth_filename(self, image_id: int) -> str:
@@ -184,6 +188,8 @@ class DepthProvider:
             return None
         if not self._compute_hypotheses:
             return DepthSample(depth=d, depth_alt=None, ambiguous=False, score=0.0)
+        if self._hypothesis_method == "gmm":
+            return self._analyze_patch_gmm(depth_map, row, col, d)
         return self._analyze_patch(depth_map, row, col, d)
 
     def _analyze_patch(self, depth_map: np.ndarray, row: int, col: int, d_center: float) -> DepthSample:
@@ -233,6 +239,54 @@ class DepthProvider:
             score=score if ambiguous else 0.0
         )
 
+    def _analyze_patch_gmm(self, depth_map: np.ndarray, row: int, col: int, d_center: float) -> DepthSample:
+        """2-component GMM ambiguity analysis on the patch around (row, col).
+
+        Fits a 2-mode GMM to the patch log-depths (discontinuities are multiplicative
+        -> log space). Ambiguous when both modes carry non-negligible mass
+        (min weight >= gmm_min_weight). Emits a weighted max-mixture (is_mixture) so
+        the per-mode sigma and weight actually enter the factor; falls back to a
+        unimodal factor otherwise. Sigmas are converted log-space -> linear-depth via
+        the delta method (sigma_lin ~ mean * sigma_log).
+        """
+        from sklearn.mixture import GaussianMixture
+
+        r = self._patch_radius
+        h, w = depth_map.shape[:2]
+        patch = depth_map[max(0, row - r) : min(h, row + r + 1), max(0, col - r) : min(w, col + r + 1)]
+        valid = patch[np.isfinite(patch) & (patch >= self._depth_min) & (patch <= self._depth_max)]
+        if valid.size < self._min_valid:
+            return DepthSample(depth=d_center, depth_alt=None, ambiguous=False, score=0.0)
+
+        logs = np.log(valid)
+        if float(logs.max() - logs.min()) < 1e-3:  # degenerate patch -> GMM covariance collapses
+            return DepthSample(depth=d_center, depth_alt=None, ambiguous=False, score=0.0)
+
+        gmm = GaussianMixture(n_components=2, covariance_type="full", random_state=0, reg_covar=1e-6)
+        gmm.fit(logs.reshape(-1, 1))
+        means = np.exp(gmm.means_.flatten())
+        weights = gmm.weights_.flatten()
+        log_sigmas = np.sqrt(gmm.covariances_.flatten())  # log-depth sigma
+
+        order = np.argsort(means)                          # near -> far
+        means, weights, log_sigmas = means[order], weights[order], log_sigmas[order]
+        sigma_lin = means * log_sigmas                     # delta method -> linear-depth sigma
+
+        ambiguous = float(weights.min()) >= self._gmm_min_weight
+        log_c = np.log(d_center)
+        pi, ai = (0, 1) if abs(log_c - np.log(means[0])) <= abs(log_c - np.log(means[1])) else (1, 0)
+        score = float(abs(np.log(means[1]) - np.log(means[0])))
+        return DepthSample(
+            depth=float(means[pi]),
+            depth_alt=float(means[ai]) if ambiguous else None,
+            ambiguous=ambiguous,
+            score=score if ambiguous else 0.0,
+            depths=(float(means[0]), float(means[1])),
+            sigmas=(float(sigma_lin[0]), float(sigma_lin[1])),
+            log_weights=(float(np.log(weights[0])), float(np.log(weights[1]))),
+            is_mixture=ambiguous,
+        )
+
 
 class MdaDepthProvider:
     """Depth source from precomputed MDA mixtures, aligned to in-memory VGGT depth.
@@ -249,10 +303,11 @@ class MdaDepthProvider:
     """
 
     def __init__(self, mda_dir, depth_arrays, *, depth_min, depth_max, gap_thresh, w_min=0.1,
-                 sigma_lo=0.33, sigma_hi=3.0, near_prior=0.3):
+                 sigma_lo=0.33, sigma_hi=3.0, near_prior=0.3, sigma_rel=0.05):
         self._dmin, self._dmax, self._gap, self._w_min = depth_min, depth_max, gap_thresh, w_min
         self._sig_lo, self._sig_hi = sigma_lo, sigma_hi  # clamp on the conf-derived sigma multiplier
         self._near_prior = near_prior  # slight log-weight penalty per depth rank (nearer = preferred)
+        self._sigma_rel = sigma_rel  # final per-mode sigma = sigma_rel x conf_mult x mode depth
         mda_dir = Path(mda_dir)
         coords_path = mda_dir / "original_coords.npy"
         coords = np.load(coords_path) if coords_path.exists() else None
@@ -289,8 +344,8 @@ class MdaDepthProvider:
         """All K MDA modes at (u,v): per-mode recon-scale depth + sigma + a slight near prior.
 
         mog_weight is NOT used. Instead the log prior penalizes farther modes by ``near_prior`` per
-        depth rank (nearer preferred). Per-mode sigma (recon units, pre-rel) = conf multiplier x mode
-        depth, with depth floored to 0.1x the image median so a near-zero mode can't collapse sigma.
+        depth rank (nearer preferred). Per-mode sigma (recon units) = sigma_rel x conf multiplier x
+        mode depth, with depth floored to 0.1x the image median so a near-zero mode can't collapse sigma.
         Behind-camera / out-of-range modes are dropped. The full mode list feeds the mixture factor;
         depth/depth_alt (two nearest) are kept only for the eval diagnostic.
         """
@@ -312,7 +367,7 @@ class MdaDepthProvider:
         mu, conf = mu[order], conf[order]
         ref, cref = self._depth_ref[image_id], self._conf_ref[image_id]
         conf_mult = np.clip(cref / (conf + 1e-12), self._sig_lo, self._sig_hi)   # low conf -> larger sigma
-        sigmas = np.clip(mu, 0.1 * ref, 10.0 * ref) * conf_mult                  # recon-unit sigma (pre-rel)
+        sigmas = self._sigma_rel * np.clip(mu, 0.1 * ref, 10.0 * ref) * conf_mult  # final recon-unit sigma
         log_weights = -self._near_prior * np.arange(len(mu), dtype=np.float64)   # slight near prior
         return DepthSample(
             depth=float(mu[0]),

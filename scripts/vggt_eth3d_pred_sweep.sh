@@ -18,9 +18,10 @@ set -eo pipefail
 module load cuda/12.6.0
 
 SEQ=${1:?usage: vggt_eth3d_pred_sweep.sh <sequence> <depth_model> [gs_max_steps] [gap_thresh]}
-MODE=${2:?depth_model: none | unimodal | drop_ambiguous | bimodal}
+MODE=${2:?mode: none | unimodal | drop_ambiguous | bimodal | bimodal_gap | bimodal_gmm | bimodal_mda}
 GS_STEPS=${3:-7000}
 GAPTHRESH=${4:-0.10}
+HMETHOD=${HMETHOD:-gap}   # ambiguity analysis for VGGT-patch modes: gap | gmm (no effect on bimodal_mda)
 
 project_name="gtsfm"
 project_root="$HOME/repos/$project_name"
@@ -67,11 +68,16 @@ fi
 BA="cluster_optimizer.optimizer.ba_options"
 
 # Condition: none | unimodal | drop_ambiguous | bimodal (VGGT depth + patch) |
+#            bimodal_gap / bimodal_gmm (VGGT depth + patch, gap vs GMM ambiguity analysis) |
 #            bimodal_mda (MDA mixture modes). bimodal* use a robust depth factor; bimodal_mda
 #            additionally sources its modes from the precomputed MDA mixture for this scene.
+# bimodal_gap/bimodal_gmm select the ambiguity analyzer explicitly; plain `bimodal` uses the
+# HMETHOD env default. All map to depth_model=bimodal; only the run-dir label differs.
 DEPTH_MODEL=$MODE
 DEPTH_ARGS=""
 case "$MODE" in
+    bimodal_gap) DEPTH_MODEL=bimodal; HMETHOD=gap; DEPTH_ARGS="$BA.depth_factor_robust_loss=true" ;;
+    bimodal_gmm) DEPTH_MODEL=bimodal; HMETHOD=gmm; DEPTH_ARGS="$BA.depth_factor_robust_loss=true" ;;
     bimodal|bimodal_mda) DEPTH_MODEL=bimodal; DEPTH_ARGS="$BA.depth_factor_robust_loss=true" ;;
 esac
 if [ "$MODE" = "bimodal_mda" ]; then
@@ -86,6 +92,7 @@ uv run python -m gtsfm.runner \
     --dataset_dir=$DATA/$SEQ/dslr_calibration_undistorted \
     --images_dir=$DATA/$SEQ/images \
     $BA.depth_model=$DEPTH_MODEL \
+    $BA.depth_hypothesis_method=$HMETHOD \
     $BA.use_gnc=false \
     $BA.depth_min=0.0 \
     $BA.depth_max=1e9 \

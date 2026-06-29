@@ -6,14 +6,19 @@ set -e
 GS_STEPS=7000
 GAP="0.10"
 
-# v1 MDA comparison: only the single-cluster scenes that already have precomputed MDA mixtures
-# at $SCRATCH/mda_mixture/<seq>_mda. Conditions: none vs bimodal (VGGT depth + patch) vs
-# bimodal_mda (MDA mixture modes). Same settings; differ only in the depth source.
+# Four-way comparison under one root, so `aggregate_modes.py --root` tables them side by side:
+#   none          - baseline BA, no depth factors
+#   bimodal_gap   - VGGT depth + patch, largest-gap ambiguity analysis
+#   bimodal_gmm   - VGGT depth + patch, 2-component GMM ambiguity analysis
+#   bimodal_mda   - MDA mixture modes (precomputed at $SCRATCH/mda_mixture/<seq>_mda)
+# Single-cluster scenes that already have MDA mixtures. Conditions differ only in the depth
+# source / ambiguity analyzer; everything else is held fixed.
+export SWEEP_NAME=${SWEEP_NAME:-eth3d_g${GAP}_compare}
 sequences="kicker office pipes relief terrace delivery_area"
 
-# Root: $SCRATCH/logs/sweeps/eth3d_g0.10/<seq>/<mode>
+# Root: $SCRATCH/logs/sweeps/$SWEEP_NAME/<seq>/<mode>
 for SEQ in $sequences; do
-    for MODE in none bimodal bimodal_mda; do
+    for MODE in none bimodal_gap bimodal_gmm bimodal_mda; do
         cluv submit mila scripts/vggt_eth3d_pred_sweep.sh -- $SEQ $MODE $GS_STEPS $GAP
     done
 done

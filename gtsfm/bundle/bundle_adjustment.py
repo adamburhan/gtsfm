@@ -304,6 +304,8 @@ class BundleAdjustmentOptions:
     depth_mda_dir: Optional[str] = None  # precomputed MDA mixtures (dump_mda_mixture); overrides patch modes
     depth_mda_sigma_rel: float = 0.05    # MDA mixture sigma RELATIVE to depth (sigma = rel*depth); scale-invariant
     depth_mda_near_prior: float = 0.3    # slight log-weight penalty per depth rank (nearer mode preferred)
+    depth_hypothesis_method: str = "gap"  # "gap" (largest-gap heuristic) | "gmm" (2-component GMM)
+    depth_gmm_min_weight: float = 0.15   # GMM: min mass on the smaller mode to flag a sample ambiguous
 
     def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
         """Construct a :class:`BundleAdjustmentOptimizer` from these options.
@@ -345,6 +347,8 @@ class BundleAdjustmentOptions:
             depth_mda_dir=self.depth_mda_dir,
             depth_mda_sigma_rel=self.depth_mda_sigma_rel,
             depth_mda_near_prior=self.depth_mda_near_prior,
+            depth_hypothesis_method=self.depth_hypothesis_method,
+            depth_gmm_min_weight=self.depth_gmm_min_weight,
         )
         kwargs.update(overrides)
         return BundleAdjustmentOptimizer(**kwargs)
@@ -412,6 +416,8 @@ class BundleAdjustmentOptimizer:
         depth_mda_dir: Optional[str] = None,
         depth_mda_sigma_rel: float = 0.05,
         depth_mda_near_prior: float = 0.3,
+        depth_hypothesis_method: str = "gap",
+        depth_gmm_min_weight: float = 0.15,
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -506,6 +512,8 @@ class BundleAdjustmentOptimizer:
         self._depth_mda_dir = depth_mda_dir
         self._depth_mda_sigma_rel = depth_mda_sigma_rel
         self._depth_mda_near_prior = depth_mda_near_prior
+        self._depth_hypothesis_method = depth_hypothesis_method
+        self._depth_gmm_min_weight = depth_gmm_min_weight
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
@@ -593,6 +601,7 @@ class BundleAdjustmentOptimizer:
                 depth_max=self._depth_max,
                 gap_thresh=self._depth_gap_thresh,
                 near_prior=self._depth_mda_near_prior,
+                sigma_rel=self._depth_mda_sigma_rel,
             )
         elif self._depth_arrays is not None:
             # In-memory depth keyed by image index; no filenames or scaling needed.
@@ -605,6 +614,8 @@ class BundleAdjustmentOptimizer:
                 gap_thresh=self._depth_gap_thresh,
                 ambiguity_thresh=self._depth_ambiguity_thresh,
                 min_valid=self._depth_min_valid,
+                hypothesis_method=self._depth_hypothesis_method,
+                gmm_min_weight=self._depth_gmm_min_weight,
             )
         elif self._depth_map_dir is not None and self._image_fnames is not None:
             self._depth_provider = DepthProvider(
@@ -619,6 +630,8 @@ class BundleAdjustmentOptimizer:
                 gap_thresh=self._depth_gap_thresh,
                 ambiguity_thresh=self._depth_ambiguity_thresh,
                 min_valid=self._depth_min_valid,
+                hypothesis_method=self._depth_hypothesis_method,
+                gmm_min_weight=self._depth_gmm_min_weight,
             )
         else:
             logger.warning(
@@ -668,15 +681,14 @@ class BundleAdjustmentOptimizer:
                     n_skipped += 1
                     continue
                 if sample.is_mixture:
-                    # All K MDA modes -> weighted max-mixture factor (no gating). Per-mode sigma is
-                    # RELATIVE to the mode depth (depth-floored x conf, then x rel) so it auto-adapts to
-                    # scene scale like a fixed pixel sigma. Weights are a slight near prior, not mog_weight.
-                    rel = self._depth_mda_sigma_rel
+                    # Weighted max-mixture factor (no gating). The provider returns final per-mode
+                    # sigmas in depth units (MDA bakes in its sigma_rel; GMM uses its fitted sigmas),
+                    # so they are passed through directly here.
                     graph.push_back(
                         make_mixture_depth_factor(
                             X(i), P(j),
                             list(sample.depths),
-                            [rel * s for s in sample.sigmas],
+                            list(sample.sigmas),
                             list(sample.log_weights),
                             unit_noise,
                         )

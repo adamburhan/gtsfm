@@ -19,6 +19,7 @@ MODE=${2:?depth_model: none | unimodal | drop_ambiguous | bimodal}
 STRIDE=${3:-10}
 GS_STEPS=${4:-7000}
 GAPTHRESH=${5:-0.15}
+HMETHOD=${HMETHOD:-gap}   # ambiguity analysis: gap (largest-gap) | gmm (2-component GMM)
 
 project_name="gtsfm"
 project_root="$HOME/repos/$project_name"
@@ -36,6 +37,7 @@ uv run python -m gtsfm.runner \
     loader.sequence=$SEQ \
     loader.stride=$STRIDE \
     $BA.depth_model=$MODE \
+    $BA.depth_hypothesis_method=$HMETHOD \
     $BA.depth_min=0.0 \
     $BA.depth_max=1e9 \
     $BA.depth_gap_thresh=$GAPTHRESH
