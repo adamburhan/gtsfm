@@ -30,7 +30,7 @@ DATA="$SCRATCH/datasets/eth3d"
 # them directly. Gap is folded into the default root name (one gap per aggregatable root,
 # since the aggregator has no gap dimension); override SWEEP_NAME to share a root across
 # manual submissions.
-SWEEP=${SWEEP_NAME:-eth3d_g${GAPTHRESH}_mda_rel}
+SWEEP=${SWEEP_NAME:-eth3d_g${GAPTHRESH}_compare}
 OUT="$SCRATCH/logs/sweeps/${SWEEP}/${SEQ}/${MODE}"
 GT="$DATA/$SEQ/${SEQ}_gt.ply"
 

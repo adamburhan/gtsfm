@@ -65,6 +65,8 @@ cluster_optimizer:
       depth_max: 1.0e9
       depth_gap_thresh: 0.15
       depth_factor_robust_loss: false
+      depth_hypothesis_method: "gap"  # gap (largest-gap) | gmm (2-component GMM)
+      depth_gmm_min_weight: 0.15      # gmm: min mass on smaller mode to flag ambiguous
       depth_mda_dir: null   # set per scene to $SCRATCH/mda_mixture/<scene>_mda for MDA modes
 
     # --- VGGT operational params ---
