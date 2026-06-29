@@ -146,13 +146,23 @@ def make_bimodal_depth_factor(pose_key: int, lm_key: int, d: float, d_alt: float
     return gtsam.CustomFactor(noise, [pose_key, lm_key], error_func)
 
 
-def make_mixture_depth_factor(pose_key, lm_key, depths, sigmas, log_weights, noise) -> "gtsam.CustomFactor":
-    """Weighted, per-mode-sigma max-mixture depth factor (N>=1 modes, no gating).
+def make_mixture_depth_factor(
+    pose_key, lm_key, depths, sigmas, log_weights, noise, null_nsigma=None
+) -> "gtsam.CustomFactor":
+    """Weighted, per-mode-sigma max-mixture depth factor (N>=1 modes), with an optional null hypothesis.
 
     Picks the component minimizing ``0.5*(r/sigma)^2 + log(sigma) - log(weight)`` and returns the
     sigma-whitened residual under a *unit* ``noise`` model. One mode → a plain depth factor; two
     modes with equal sigma/weight → the old min-|r| bimodal factor. So treating a unimodal pixel as
     two near-identical modes is a no-op, and every measurement can use this.
+
+    Null hypothesis (``null_nsigma``): when set, if even the *selected* mode is more than
+    ``null_nsigma`` sigmas from the predicted depth, the factor opts out — it returns a zero residual
+    with a zero Jacobian, so only the reprojection factor constrains that measurement. This is the
+    Olson–Agarwal max-mixture null component: it lets BA reject depth where no candidate agrees with
+    the multi-view geometry, instead of being dragged toward the least-bad (still wrong) mode. A
+    hard-redescending gate — strictly stronger than a Huber loss, which keeps a constant tail pull.
+    Default ``None`` leaves behaviour unchanged.
     """
     depths = np.asarray(depths, dtype=np.float64)
     sigmas = np.asarray(sigmas, dtype=np.float64)
@@ -167,6 +177,12 @@ def make_mixture_depth_factor(pose_key, lm_key, depths, sigmas, log_weights, noi
         z_pred = float(point_c[2])
         r = (z_pred - depths) / sigmas
         k = int(np.argmin(0.5 * r * r + np.log(sigmas) - log_weights))
+        if null_nsigma is not None and abs(r[k]) > null_nsigma:
+            # Null hypothesis selected: no mode fits the geometry -> disable the depth term here.
+            if H is not None:
+                H[0] = np.zeros((1, 6), dtype=np.float64)
+                H[1] = np.zeros((1, 3), dtype=np.float64)
+            return np.array([0.0], dtype=np.float64)
         if H is not None:
             H[0] = H_pose[2:3, :] / sigmas[k]
             H[1] = H_point[2:3, :] / sigmas[k]
@@ -307,6 +323,7 @@ class BundleAdjustmentOptions:
     depth_hypothesis_method: str = "gap"  # "gap" (largest-gap heuristic) | "gmm" (2-component GMM)
     depth_gmm_min_weight: float = 0.15   # GMM: min mass on the smaller mode to flag a sample ambiguous
     depth_gmm_sigma_floor: float = 0.05  # GMM: relative floor on per-mode sigma (frac of mode depth)
+    depth_null_nsigma: Optional[float] = None  # mixture null hypothesis: opt out if best mode > N sigmas off (None=off)
 
     def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
         """Construct a :class:`BundleAdjustmentOptimizer` from these options.
@@ -351,6 +368,7 @@ class BundleAdjustmentOptions:
             depth_hypothesis_method=self.depth_hypothesis_method,
             depth_gmm_min_weight=self.depth_gmm_min_weight,
             depth_gmm_sigma_floor=self.depth_gmm_sigma_floor,
+            depth_null_nsigma=self.depth_null_nsigma,
         )
         kwargs.update(overrides)
         return BundleAdjustmentOptimizer(**kwargs)
@@ -421,6 +439,7 @@ class BundleAdjustmentOptimizer:
         depth_hypothesis_method: str = "gap",
         depth_gmm_min_weight: float = 0.15,
         depth_gmm_sigma_floor: float = 0.05,
+        depth_null_nsigma: Optional[float] = None,
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -518,6 +537,7 @@ class BundleAdjustmentOptimizer:
         self._depth_hypothesis_method = depth_hypothesis_method
         self._depth_gmm_min_weight = depth_gmm_min_weight
         self._depth_gmm_sigma_floor = depth_gmm_sigma_floor
+        self._depth_null_nsigma = depth_null_nsigma
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
@@ -697,6 +717,7 @@ class BundleAdjustmentOptimizer:
                             list(sample.sigmas),
                             list(sample.log_weights),
                             unit_noise,
+                            null_nsigma=self._depth_null_nsigma,
                         )
                     )
                     n_bimodal += 1
