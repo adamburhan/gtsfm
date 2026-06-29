@@ -63,7 +63,7 @@ if [ ! -f "$GT" ]; then
     rm -f "$TMP"
 fi
 
-BA="cluster_optimizer.optimizer.bundle_adjustment_module"
+BA="cluster_optimizer.multiview_optimizer.bundle_adjustment_module"
 
 # Depth source shared by all bimodal modes. The template's braces are single-quoted so Hydra reads
 # it as a literal string (DSC_6487.JPG -> DSC_6487.npy). depth_scale=1 (float meters); depth_auto_scale
