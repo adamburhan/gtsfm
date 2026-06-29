@@ -122,6 +122,11 @@ cluster_optimizer:
       depth_gap_thresh: 0.15
       depth_ambiguity_thresh: 0.20
       depth_min_valid: 10
+      depth_hypothesis_method: "gap"  # gap (largest-gap) | gmm (2-component GMM)
+      depth_gmm_min_weight: 0.15      # gmm: min mass on smaller mode to flag ambiguous
+      depth_gmm_sigma_floor: 0.05     # gmm: relative floor on per-mode sigma (frac of mode depth)
+      depth_null_nsigma: null         # mixture null hypothesis: opt out if best mode > N sigmas off (null=off)
+      depth_auto_scale: false         # divide metric depth by a robust global recon<-metric scale (classical SfM)
 
   # comment out to not run
   dense_multiview_optimizer:

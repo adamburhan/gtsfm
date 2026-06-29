@@ -324,6 +324,7 @@ class BundleAdjustmentOptions:
     depth_gmm_min_weight: float = 0.15   # GMM: min mass on the smaller mode to flag a sample ambiguous
     depth_gmm_sigma_floor: float = 0.05  # GMM: relative floor on per-mode sigma (frac of mode depth)
     depth_null_nsigma: Optional[float] = None  # mixture null hypothesis: opt out if best mode > N sigmas off (None=off)
+    depth_auto_scale: bool = False  # divide metric depth by a robust global recon<-metric scale before BA (classical SfM)
 
     def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
         """Construct a :class:`BundleAdjustmentOptimizer` from these options.
@@ -369,6 +370,7 @@ class BundleAdjustmentOptions:
             depth_gmm_min_weight=self.depth_gmm_min_weight,
             depth_gmm_sigma_floor=self.depth_gmm_sigma_floor,
             depth_null_nsigma=self.depth_null_nsigma,
+            depth_auto_scale=self.depth_auto_scale,
         )
         kwargs.update(overrides)
         return BundleAdjustmentOptimizer(**kwargs)
@@ -440,6 +442,7 @@ class BundleAdjustmentOptimizer:
         depth_gmm_min_weight: float = 0.15,
         depth_gmm_sigma_floor: float = 0.05,
         depth_null_nsigma: Optional[float] = None,
+        depth_auto_scale: bool = False,
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -538,6 +541,7 @@ class BundleAdjustmentOptimizer:
         self._depth_gmm_min_weight = depth_gmm_min_weight
         self._depth_gmm_sigma_floor = depth_gmm_sigma_floor
         self._depth_null_nsigma = depth_null_nsigma
+        self._depth_auto_scale = depth_auto_scale
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
@@ -668,6 +672,46 @@ class BundleAdjustmentOptimizer:
             return None
         return self._depth_provider
 
+    def __estimate_recon_metric_scale(
+        self, initial_data: GtsfmData, cameras_to_model: List[int], depth_provider: DepthProvider
+    ) -> float:
+        """Robust global scale ``s`` mapping metric depth into the gauge-arbitrary recon scale.
+
+        Classical SfM fixes scale only up to one global similarity, so a single scalar
+        ``s = exp(median(log d_metric - log z_pred_init))`` over sampled measurements aligns the
+        (metric) depth maps to the reconstruction. Estimated in log space so far points don't
+        dominate, and capped at a few thousand samples since one global DOF needs no more. Depths
+        and per-mode sigmas are divided by ``s`` when building factors; the whitened
+        ``null_nsigma`` is scale-invariant and unaffected.
+        """
+        max_samples = 5000
+        log_ratios: List[float] = []
+        for j in range(initial_data.number_tracks()):
+            track = initial_data.get_track(j)
+            point_w = track.point3()
+            for m_idx in range(track.numberMeasurements()):
+                i, uv = track.measurement(m_idx)
+                if i not in cameras_to_model:
+                    continue
+                cam = initial_data.get_camera(i)
+                if cam is None:
+                    continue
+                z_init = float(cam.pose().transformTo(point_w)[2])
+                if z_init <= 1e-6:
+                    continue
+                sample = depth_provider.get_depth(i, float(uv[0]), float(uv[1]))
+                if sample is None or sample.depth <= 0.0:
+                    continue
+                log_ratios.append(float(np.log(sample.depth) - np.log(z_init)))
+            if len(log_ratios) >= max_samples:
+                break
+        if not log_ratios:
+            logger.warning("Depth auto-scale enabled but no valid samples; using s=1.0.")
+            return 1.0
+        s = float(np.exp(np.median(log_ratios)))
+        logger.info("Depth auto-scale: recon<-metric s=%.4f from %d samples.", s, len(log_ratios))
+        return s
+
     def __depth_factors(self, initial_data: GtsfmData, cameras_to_model: List[int]) -> NonlinearFactorGraph:
         """Generate camera-frame-Z depth factors for track measurements.
 
@@ -688,6 +732,9 @@ class BundleAdjustmentOptimizer:
         if self._depth_factor_robust_loss:
             depth_noise = Robust(mEstimator.Huber(self._robust_noise_basin), depth_noise)
             unit_noise = Robust(mEstimator.Huber(self._robust_noise_basin), unit_noise)
+
+        # Bring metric depth into the recon scale (no-op / s=1 unless depth_auto_scale is set).
+        sf = self.__estimate_recon_metric_scale(initial_data, cameras_to_model, depth_provider) if self._depth_auto_scale else 1.0
 
         n_unimodal = 0
         n_bimodal = 0
@@ -713,8 +760,8 @@ class BundleAdjustmentOptimizer:
                     graph.push_back(
                         make_mixture_depth_factor(
                             X(i), P(j),
-                            list(sample.depths),
-                            list(sample.sigmas),
+                            [d / sf for d in sample.depths],
+                            [s_ / sf for s_ in sample.sigmas],
                             list(sample.log_weights),
                             unit_noise,
                             null_nsigma=self._depth_null_nsigma,
@@ -728,11 +775,11 @@ class BundleAdjustmentOptimizer:
                 if sample.ambiguous and self._depth_model == DepthFactorMode.BIMODAL:
                     assert sample.depth_alt is not None
                     graph.push_back(
-                        make_bimodal_depth_factor(X(i), P(j), sample.depth, sample.depth_alt, depth_noise)
+                        make_bimodal_depth_factor(X(i), P(j), sample.depth / sf, sample.depth_alt / sf, depth_noise)
                     )
                     n_bimodal += 1
                 else:
-                    graph.push_back(make_depth_factor(X(i), P(j), sample.depth, depth_noise))
+                    graph.push_back(make_depth_factor(X(i), P(j), sample.depth / sf, depth_noise))
                     n_unimodal += 1
 
         logger.info(
