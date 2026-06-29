@@ -25,6 +25,8 @@ MODE=${2:?mode: none | bimodal_gap | bimodal_gmm | bimodal_gmm_null}
 GAPTHRESH=${3:-0.10}
 MAX_RES=${MAX_RES:-760}          # loader short-side cap; depth .npy must match this resolution
 NULL_NSIGMA=${NULL_NSIGMA:-5}    # bimodal_gmm_null: opt out when best mode > N sigmas off
+GT_POSES=${GT_POSES:-false}      # false = real from-scratch SfM (gauge-free); true = GT-anchored metric poses
+AUTO_SCALE=${AUTO_SCALE:-true}   # reconcile metric depth with recon scale; needed iff GT_POSES=false
 
 project_name="gtsfm"
 project_root="$HOME/repos/$project_name"
@@ -70,7 +72,7 @@ BA="cluster_optimizer.multiview_optimizer.bundle_adjustment_module"
 # reconciles metric depth with the arbitrary classical-SfM scale.
 DEPTH_COMMON="$BA.depth_map_dir=$DEPTH_DIR \
     $BA.depth_filename_template='DSC_{}.npy' \
-    $BA.depth_scale=1.0 $BA.depth_auto_scale=true \
+    $BA.depth_scale=1.0 $BA.depth_auto_scale=$AUTO_SCALE \
     $BA.depth_min=0.1 $BA.depth_max=100.0 $BA.depth_gap_thresh=$GAPTHRESH"
 
 DEPTH_ARGS=""
@@ -83,7 +85,7 @@ case "$MODE" in
     *) echo "unknown mode: $MODE" >&2; exit 1 ;;
 esac
 
-echo "=== [1/2] GTSfM (unified/classical): seq=$SEQ mode=$MODE gap_thresh=$GAPTHRESH max_res=$MAX_RES ==="
+echo "=== [1/2] GTSfM (unified/classical): seq=$SEQ mode=$MODE gap_thresh=$GAPTHRESH max_res=$MAX_RES gt_poses=$GT_POSES auto_scale=$AUTO_SCALE ==="
 uv run python -m gtsfm.runner \
     --config_name unified.yaml \
     --loader colmap \
@@ -92,6 +94,7 @@ uv run python -m gtsfm.runner \
     --max_resolution $MAX_RES \
     --output_root $OUT \
     --dask_tmpdir $SLURM_TMPDIR \
+    loader.use_gt_extrinsics=$GT_POSES \
     $DEPTH_ARGS
 
 # The single-cluster classical reconstruction is written under results/. Prefer the merged scene if
