@@ -84,6 +84,7 @@ class DepthProvider:
         min_valid: int = 10,
         hypothesis_method: str = "gap",
         gmm_min_weight: float = 0.15,
+        gmm_sigma_floor: float = 0.05,
     ) -> None:
         """
         Args:
@@ -136,6 +137,7 @@ class DepthProvider:
         self._min_valid = min_valid
         self._hypothesis_method = hypothesis_method
         self._gmm_min_weight = gmm_min_weight
+        self._gmm_sigma_floor = gmm_sigma_floor
         self._cache: Dict[int, Optional[np.ndarray]] = {}
 
     def _depth_filename(self, image_id: int) -> str:
@@ -270,7 +272,9 @@ class DepthProvider:
 
         order = np.argsort(means)                          # near -> far
         means, weights, log_sigmas = means[order], weights[order], log_sigmas[order]
-        sigma_lin = means * log_sigmas                     # delta method -> linear-depth sigma
+        # delta method -> linear-depth sigma, with a relative floor so a noise-split of a unimodal
+        # patch can't produce a pathologically tight (over-confident) per-mode factor.
+        sigma_lin = np.maximum(means * log_sigmas, self._gmm_sigma_floor * means)
 
         ambiguous = float(weights.min()) >= self._gmm_min_weight
         log_c = np.log(d_center)

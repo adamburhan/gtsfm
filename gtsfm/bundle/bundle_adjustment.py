@@ -306,6 +306,7 @@ class BundleAdjustmentOptions:
     depth_mda_near_prior: float = 0.3    # slight log-weight penalty per depth rank (nearer mode preferred)
     depth_hypothesis_method: str = "gap"  # "gap" (largest-gap heuristic) | "gmm" (2-component GMM)
     depth_gmm_min_weight: float = 0.15   # GMM: min mass on the smaller mode to flag a sample ambiguous
+    depth_gmm_sigma_floor: float = 0.05  # GMM: relative floor on per-mode sigma (frac of mode depth)
 
     def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
         """Construct a :class:`BundleAdjustmentOptimizer` from these options.
@@ -349,6 +350,7 @@ class BundleAdjustmentOptions:
             depth_mda_near_prior=self.depth_mda_near_prior,
             depth_hypothesis_method=self.depth_hypothesis_method,
             depth_gmm_min_weight=self.depth_gmm_min_weight,
+            depth_gmm_sigma_floor=self.depth_gmm_sigma_floor,
         )
         kwargs.update(overrides)
         return BundleAdjustmentOptimizer(**kwargs)
@@ -418,6 +420,7 @@ class BundleAdjustmentOptimizer:
         depth_mda_near_prior: float = 0.3,
         depth_hypothesis_method: str = "gap",
         depth_gmm_min_weight: float = 0.15,
+        depth_gmm_sigma_floor: float = 0.05,
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -514,6 +517,7 @@ class BundleAdjustmentOptimizer:
         self._depth_mda_near_prior = depth_mda_near_prior
         self._depth_hypothesis_method = depth_hypothesis_method
         self._depth_gmm_min_weight = depth_gmm_min_weight
+        self._depth_gmm_sigma_floor = depth_gmm_sigma_floor
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
@@ -616,6 +620,7 @@ class BundleAdjustmentOptimizer:
                 min_valid=self._depth_min_valid,
                 hypothesis_method=self._depth_hypothesis_method,
                 gmm_min_weight=self._depth_gmm_min_weight,
+                gmm_sigma_floor=self._depth_gmm_sigma_floor,
             )
         elif self._depth_map_dir is not None and self._image_fnames is not None:
             self._depth_provider = DepthProvider(
@@ -632,6 +637,7 @@ class BundleAdjustmentOptimizer:
                 min_valid=self._depth_min_valid,
                 hypothesis_method=self._depth_hypothesis_method,
                 gmm_min_weight=self._depth_gmm_min_weight,
+                gmm_sigma_floor=self._depth_gmm_sigma_floor,
             )
         else:
             logger.warning(
