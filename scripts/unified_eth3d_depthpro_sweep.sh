@@ -27,6 +27,9 @@ MAX_RES=${MAX_RES:-760}          # loader short-side cap; depth .npy must match 
 NULL_NSIGMA=${NULL_NSIGMA:-5}    # bimodal_gmm_null: opt out when best mode > N sigmas off
 GT_POSES=${GT_POSES:-false}      # false = real from-scratch SfM (gauge-free); true = GT-anchored metric poses
 AUTO_SCALE=${AUTO_SCALE:-true}   # reconcile metric depth with recon scale; needed iff GT_POSES=false
+GT_GATE=${GT_GATE:-true}        # oracle diagnostic: drop depth factors whose modes all miss the GT surface
+GT_TAU=${GT_TAU:-0.1}           # gate band (m): a mode this close to GT counts as valid
+GT_ORACLE=${GT_ORACLE:-false}    # also collapse to the GT-closest mode (mode-selection ceiling)
 
 project_name="gtsfm"
 project_root="$HOME/repos/$project_name"
@@ -73,7 +76,9 @@ BA="cluster_optimizer.multiview_optimizer.bundle_adjustment_module"
 DEPTH_COMMON="$BA.depth_map_dir=$DEPTH_DIR \
     $BA.depth_filename_template='DSC_{}.npy' \
     $BA.depth_scale=1.0 $BA.depth_auto_scale=$AUTO_SCALE \
-    $BA.depth_min=0.1 $BA.depth_max=100.0 $BA.depth_gap_thresh=$GAPTHRESH"
+    $BA.depth_min=0.1 $BA.depth_max=100.0 $BA.depth_gap_thresh=$GAPTHRESH \
+    $BA.depth_gt_gate=$GT_GATE $BA.depth_gt_ply=$GT $BA.depth_gt_align_ref=$COLMAP_DIR \
+    $BA.depth_gt_tau=$GT_TAU $BA.depth_gt_oracle_select=$GT_ORACLE"
 
 DEPTH_ARGS=""
 case "$MODE" in
@@ -85,7 +90,7 @@ case "$MODE" in
     *) echo "unknown mode: $MODE" >&2; exit 1 ;;
 esac
 
-echo "=== [1/2] GTSfM (unified/classical): seq=$SEQ mode=$MODE gap_thresh=$GAPTHRESH max_res=$MAX_RES gt_poses=$GT_POSES auto_scale=$AUTO_SCALE ==="
+echo "=== [1/2] GTSfM (unified/classical): seq=$SEQ mode=$MODE gap=$GAPTHRESH max_res=$MAX_RES gt_poses=$GT_POSES auto_scale=$AUTO_SCALE gt_gate=$GT_GATE oracle=$GT_ORACLE ==="
 uv run python -m gtsfm.runner \
     --config_name unified.yaml \
     --loader colmap \

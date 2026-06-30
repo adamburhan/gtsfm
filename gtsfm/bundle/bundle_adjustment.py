@@ -325,6 +325,14 @@ class BundleAdjustmentOptions:
     depth_gmm_sigma_floor: float = 0.05  # GMM: relative floor on per-mode sigma (frac of mode depth)
     depth_null_nsigma: Optional[float] = None  # mixture null hypothesis: opt out if best mode > N sigmas off (None=off)
     depth_auto_scale: bool = False  # divide metric depth by a robust global recon<-metric scale before BA (classical SfM)
+    # GT null-hypothesis gate (oracle diagnostic): drop a measurement's depth factor unless some mode
+    # backprojects within depth_gt_tau of the GT cloud. Isolates whether bad candidates (vs the BA
+    # mechanism) are the bottleneck. Requires the GT cloud + the COLMAP GT-pose dir.
+    depth_gt_gate: bool = False
+    depth_gt_ply: Optional[str] = None
+    depth_gt_align_ref: Optional[str] = None  # COLMAP GT dir (poses), as eval_geometry's --align_ref
+    depth_gt_tau: float = 0.05
+    depth_gt_oracle_select: bool = False  # also collapse to the GT-closest mode (mode-selection ceiling)
 
     def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
         """Construct a :class:`BundleAdjustmentOptimizer` from these options.
@@ -371,6 +379,11 @@ class BundleAdjustmentOptions:
             depth_gmm_sigma_floor=self.depth_gmm_sigma_floor,
             depth_null_nsigma=self.depth_null_nsigma,
             depth_auto_scale=self.depth_auto_scale,
+            depth_gt_gate=self.depth_gt_gate,
+            depth_gt_ply=self.depth_gt_ply,
+            depth_gt_align_ref=self.depth_gt_align_ref,
+            depth_gt_tau=self.depth_gt_tau,
+            depth_gt_oracle_select=self.depth_gt_oracle_select,
         )
         kwargs.update(overrides)
         return BundleAdjustmentOptimizer(**kwargs)
@@ -443,6 +456,11 @@ class BundleAdjustmentOptimizer:
         depth_gmm_sigma_floor: float = 0.05,
         depth_null_nsigma: Optional[float] = None,
         depth_auto_scale: bool = False,
+        depth_gt_gate: bool = False,
+        depth_gt_ply: Optional[str] = None,
+        depth_gt_align_ref: Optional[str] = None,
+        depth_gt_tau: float = 0.05,
+        depth_gt_oracle_select: bool = False,
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -542,6 +560,11 @@ class BundleAdjustmentOptimizer:
         self._depth_gmm_sigma_floor = depth_gmm_sigma_floor
         self._depth_null_nsigma = depth_null_nsigma
         self._depth_auto_scale = depth_auto_scale
+        self._depth_gt_gate = depth_gt_gate
+        self._depth_gt_ply = depth_gt_ply
+        self._depth_gt_align_ref = depth_gt_align_ref
+        self._depth_gt_tau = depth_gt_tau
+        self._depth_gt_oracle_select = depth_gt_oracle_select
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
@@ -712,6 +735,60 @@ class BundleAdjustmentOptimizer:
         logger.info("Depth auto-scale: recon<-metric s=%.4f from %d samples.", s, len(log_ratios))
         return s
 
+    def __build_gt_gate(self, initial_data: GtsfmData, cameras_to_model: List[int]):
+        """Build the GT null-hypothesis gate, or None if disabled/unavailable.
+
+        Aligns the current recon to the GT poses (same Sim(3) as the pose-AUC / geometry eval) and
+        loads the GT cloud into a KD-tree. Returns ``(gt_tree, to_world, scale)`` where ``to_world``
+        maps a recon point into the GT/world frame and ``scale`` is the recon->world factor, so a
+        metric mode ``d`` placed via ``to_world(cam.backproject(uv, d/scale))`` lands at its true
+        metric position. Reads GT poses straight from the COLMAP dir, so it works even when the
+        reconstruction itself used estimated (non-GT) extrinsics.
+        """
+        if not self._depth_gt_gate:
+            return None
+        if self._depth_gt_ply is None or self._depth_gt_align_ref is None or self._image_fnames is None:
+            logger.warning("depth_gt_gate set but missing ply / align_ref / image_fnames; skipping GT gate.")
+            return None
+        from scipy.spatial import cKDTree
+
+        from gtsfm.evaluation.eval_geometry import _gt_poses_from_colmap, load_gt_points, sim3_align
+
+        # _gt_poses_from_colmap expects a list whose position == camera index (matches wTi_list);
+        # convert the {idx: name} map, filling gaps with "" so missing slots are skipped, not crash.
+        n = max(cameras_to_model) + 1
+        wTi_list = [None] * n
+        img_fnames_list = [""] * n
+        for i in cameras_to_model:
+            cam = initial_data.get_camera(i)
+            if cam is not None:
+                wTi_list[i] = cam.pose()
+            if i in self._image_fnames:
+                img_fnames_list[i] = self._image_fnames[i]
+        try:
+            wSr, rms = sim3_align(wTi_list, _gt_poses_from_colmap(self._depth_gt_align_ref, img_fnames_list))
+        except (ValueError, KeyError) as exc:
+            logger.warning("GT gate: alignment failed (%s); skipping GT gate.", exc)
+            return None
+        gt_tree = cKDTree(load_gt_points(self._depth_gt_ply))
+        logger.info(
+            "GT gate: recon->world scale=%.4f, camera RMS=%.4f m, tau=%.3f m, oracle_select=%s",
+            wSr.scale(), rms, self._depth_gt_tau, self._depth_gt_oracle_select,
+        )
+        return gt_tree, (lambda p: np.array(wSr.transformFrom(np.asarray(p, dtype=float)))), float(wSr.scale())
+
+    def __gt_gate_modes(self, cam, uv, modes, gate) -> Tuple[bool, Optional[float]]:
+        """Is any mode within tau of the GT cloud? Returns (keep, GT-closest mode)."""
+        gt_tree, to_world, scale = gate
+        best_mode, best_dist = None, float("inf")
+        for d in modes:
+            if d is None or d <= 0.0:
+                continue
+            dist = float(gt_tree.query(to_world(cam.backproject(uv, float(d) / scale)))[0])
+            if dist < best_dist:
+                best_dist, best_mode = dist, float(d)
+        return best_dist < self._depth_gt_tau, best_mode
+
     def __depth_factors(self, initial_data: GtsfmData, cameras_to_model: List[int]) -> NonlinearFactorGraph:
         """Generate camera-frame-Z depth factors for track measurements.
 
@@ -736,10 +813,14 @@ class BundleAdjustmentOptimizer:
         # Bring metric depth into the recon scale (no-op / s=1 unless depth_auto_scale is set).
         sf = self.__estimate_recon_metric_scale(initial_data, cameras_to_model, depth_provider) if self._depth_auto_scale else 1.0
 
+        # GT null-hypothesis gate (oracle diagnostic): drop factors whose modes all miss the GT surface.
+        gate = self.__build_gt_gate(initial_data, cameras_to_model)
+
         n_unimodal = 0
         n_bimodal = 0
         n_dropped_ambiguous = 0
         n_skipped = 0
+        n_gt_gated = 0
         for j in range(initial_data.number_tracks()):
             track = initial_data.get_track(j)
             valid_measurements = [
@@ -753,6 +834,20 @@ class BundleAdjustmentOptimizer:
                 if sample is None:
                     n_skipped += 1
                     continue
+                if gate is not None:
+                    modes = (
+                        list(sample.depths) if sample.is_mixture
+                        else ([sample.depth, sample.depth_alt] if sample.depth_alt is not None else [sample.depth])
+                    )
+                    keep, best_mode = self.__gt_gate_modes(initial_data.get_camera(i), uv, modes, gate)
+                    if not keep:
+                        n_gt_gated += 1
+                        continue
+                    if self._depth_gt_oracle_select and best_mode is not None:
+                        # Mode-selection ceiling: collapse to the GT-closest hypothesis (unimodal).
+                        graph.push_back(make_depth_factor(X(i), P(j), best_mode / sf, depth_noise))
+                        n_unimodal += 1
+                        continue
                 if sample.is_mixture:
                     # Weighted max-mixture factor (no gating). The provider returns final per-mode
                     # sigmas in depth units (MDA bakes in its sigma_rel; GMM uses its fitted sigmas),
@@ -783,18 +878,20 @@ class BundleAdjustmentOptimizer:
                     n_unimodal += 1
 
         logger.info(
-            "Depth factors (%s): %d unimodal, %d bimodal, %d ambiguous dropped, %d skipped (missing/out-of-range).",
+            "Depth factors (%s): %d unimodal, %d bimodal, %d ambiguous dropped, %d skipped, %d GT-gated.",
             self._depth_model.value,
             n_unimodal,
             n_bimodal,
             n_dropped_ambiguous,
             n_skipped,
+            n_gt_gated,
         )
         self._depth_factor_stats = {
             "unimodal": n_unimodal,
             "bimodal": n_bimodal,
             "dropped_ambiguous": n_dropped_ambiguous,
             "skipped": n_skipped,
+            "gt_gated": n_gt_gated,
         }
         return graph
 
