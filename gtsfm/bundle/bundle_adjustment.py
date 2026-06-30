@@ -815,11 +815,20 @@ class BundleAdjustmentOptimizer:
             depth_noise = Robust(mEstimator.Huber(self._robust_noise_basin), depth_noise)
             unit_noise = Robust(mEstimator.Huber(self._robust_noise_basin), unit_noise)
 
-        # Bring metric depth into the recon scale (no-op / s=1 unless depth_auto_scale is set).
-        sf = self.__estimate_recon_metric_scale(initial_data, cameras_to_model, depth_provider) if self._depth_auto_scale else 1.0
-
         # GT null-hypothesis gate (oracle diagnostic): drop factors whose modes all miss the GT surface.
         gate = self.__build_gt_gate(initial_data, cameras_to_model)
+
+        # Scale mapping metric depth into the recon frame. Prefer the gate's geometric (camera-based)
+        # Sim(3) scale when the gate is on: it is robust, whereas the point-ratio auto_scale is a median
+        # over ALL modes and collapses when most are garbage (delivery_area: 92% bad -> recon shrank to
+        # 1/3). Fall back to auto_scale, then 1.0.
+        if gate is not None:
+            sf = gate[2]
+            logger.info("Depth factor scale: using GT-gate geometric scale sf=%.4f.", sf)
+        elif self._depth_auto_scale:
+            sf = self.__estimate_recon_metric_scale(initial_data, cameras_to_model, depth_provider)
+        else:
+            sf = 1.0
 
         n_unimodal = 0
         n_bimodal = 0
