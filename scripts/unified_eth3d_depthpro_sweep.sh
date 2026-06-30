@@ -21,7 +21,7 @@ set -eo pipefail
 module load cuda/12.6.0
 
 SEQ=${1:?usage: unified_eth3d_depthpro_sweep.sh <sequence> <mode> [gap_thresh]}
-MODE=${2:?mode: none | bimodal_gap | bimodal_gmm | bimodal_gmm_null}
+MODE=${2:?mode: none | unimodal | bimodal_gap | bimodal_gmm | bimodal_gmm_null}
 GAPTHRESH=${3:-0.10}
 MAX_RES=${MAX_RES:-760}          # loader short-side cap; depth .npy must match this resolution
 NULL_NSIGMA=${NULL_NSIGMA:-5}    # bimodal_gmm_null: opt out when best mode > N sigmas off
@@ -85,6 +85,7 @@ DEPTH_COMMON="$BA.depth_map_dir=$DEPTH_DIR \
 DEPTH_ARGS=""
 case "$MODE" in
     none) DEPTH_ARGS="$BA.depth_model=none" ;;
+    unimodal) DEPTH_ARGS="$BA.depth_model=unimodal $DEPTH_COMMON" ;;  # single depth factor, no patch/GMM (use for clean GT-depth oracle)
     bimodal_gap) DEPTH_ARGS="$BA.depth_model=bimodal $BA.depth_hypothesis_method=gap $DEPTH_COMMON" ;;
     bimodal_gmm) DEPTH_ARGS="$BA.depth_model=bimodal $BA.depth_hypothesis_method=gmm $DEPTH_COMMON" ;;
     bimodal_gmm_null) DEPTH_ARGS="$BA.depth_model=bimodal $BA.depth_hypothesis_method=gmm \
