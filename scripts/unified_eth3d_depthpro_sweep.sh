@@ -27,7 +27,7 @@ MAX_RES=${MAX_RES:-760}          # loader short-side cap; depth .npy must match 
 NULL_NSIGMA=${NULL_NSIGMA:-5}    # bimodal_gmm_null: opt out when best mode > N sigmas off
 GT_POSES=${GT_POSES:-false}      # false = real from-scratch SfM (gauge-free); true = GT-anchored metric poses
 AUTO_SCALE=${AUTO_SCALE:-true}   # reconcile metric depth with recon scale; needed iff GT_POSES=false
-GT_GATE=${GT_GATE:-false}        # oracle diagnostic: drop depth factors whose modes all miss the GT surface
+GT_GATE=${GT_GATE:-true}        # oracle diagnostic: drop depth factors whose modes all miss the GT surface
 GT_TAU=${GT_TAU:-0.1}           # gate band (m): a mode this close to GT counts as valid
 GT_ORACLE=${GT_ORACLE:-false}    # also collapse to the GT-closest mode (mode-selection ceiling)
 PATCH_RADIUS=${PATCH_RADIUS:-3}  # half-size of the patch for gap/GMM ambiguity analysis
@@ -38,9 +38,10 @@ DATA="$SCRATCH/datasets/eth3d"
 SWEEP=${SWEEP_NAME:-eth3d_unified_depthpro_g${GAPTHRESH}}
 OUT="$SCRATCH/logs/sweeps/${SWEEP}/${SEQ}/${MODE}"
 GT="$DATA/$SEQ/${SEQ}_gt.ply"
+GT_MESH="$DATA/$SEQ/occlusion/surface_mesh.ply"   # ETH3D occlusion surface mesh (true point-to-surface gating)
 COLMAP_DIR="$DATA/$SEQ/dslr_calibration_undistorted"
 IMAGES_DIR="$DATA/$SEQ/images"
-DEPTH_DIR="$DATA/$SEQ/${DEPTH_SUBDIR:-gt_depth_mesh_760}"   # set DEPTH_SUBDIR=gt_depth_760 for the GT-depth-as-source oracle
+DEPTH_DIR="$DATA/$SEQ/${DEPTH_SUBDIR:-depth_pro_760}"   # set DEPTH_SUBDIR=gt_depth_760 for the GT-depth-as-source oracle
 
 echo "GIT_COMMIT=${GIT_COMMIT:?GIT_COMMIT is not set. Use 'cluv submit' to submit this job script.}"
 cd $SLURM_TMPDIR
@@ -79,7 +80,7 @@ DEPTH_COMMON="$BA.depth_map_dir=$DEPTH_DIR \
     $BA.depth_scale=1.0 $BA.depth_auto_scale=$AUTO_SCALE \
     $BA.depth_min=0.1 $BA.depth_max=100.0 $BA.depth_gap_thresh=$GAPTHRESH \
     $BA.depth_patch_radius=$PATCH_RADIUS \
-    $BA.depth_gt_gate=$GT_GATE $BA.depth_gt_ply=$GT $BA.depth_gt_align_ref=$COLMAP_DIR \
+    $BA.depth_gt_gate=$GT_GATE $BA.depth_gt_ply=$GT_MESH $BA.depth_gt_align_ref=$COLMAP_DIR \
     $BA.depth_gt_tau=$GT_TAU $BA.depth_gt_oracle_select=$GT_ORACLE"
 
 DEPTH_ARGS=""
@@ -118,7 +119,7 @@ uv run python gtsfm/evaluation/eval_geometry.py \
     --sfm_output $SFM \
     --align_mode eth3d \
     --align_ref $COLMAP_DIR \
-    --gt_ply $GT \
+    --gt_ply $GT_MESH \
     --tau 0.01 0.02 0.05 0.1 0.2 0.5 \
     --out $OUT/geometry_metrics.json
 

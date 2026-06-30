@@ -73,9 +73,33 @@ def load_gt_points(gt_ply: str) -> np.ndarray:
     return np.asarray(geo.vertices)
 
 
-def evaluate_points(points: np.ndarray, gt_points: np.ndarray, taus: list[float]) -> dict:
-    """Compute T&T-style precision/recall/F-score and distance statistics."""
-    d_acc = cKDTree(gt_points).query(points, k=1)[0]  # recon -> GT
+def build_gt(gt_ply: str):
+    """Returns (gt_points, gt_dist): GT surface points for completeness, and a recon->GT distance fn.
+
+    For a mesh PLY, gt_dist is true point-to-SURFACE distance (open3d raycasting), and gt_points are
+    uniformly sampled from the surface. For a point-cloud PLY it falls back to nearest-point (which
+    overestimates near the surface). Prefer a mesh (e.g. ETH3D occlusion/surface_mesh.ply).
+    """
+    import open3d as o3d
+
+    o3d_mesh = o3d.io.read_triangle_mesh(gt_ply)
+    if len(o3d_mesh.triangles) > 0:
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(o3d_mesh))
+        gt_points = np.asarray(o3d_mesh.sample_points_uniformly(N_GT_SAMPLES).points)  # completeness
+        return gt_points, lambda p: scene.compute_distance(o3d.core.Tensor(np.asarray(p, np.float32))).numpy()
+    gt_points = load_gt_points(gt_ply)
+    tree = cKDTree(gt_points)
+    return gt_points, lambda p: tree.query(np.asarray(p))[0]
+
+
+def evaluate_points(points: np.ndarray, gt_points: np.ndarray, taus: list[float], gt_dist=None) -> dict:
+    """Compute T&T-style precision/recall/F-score and distance statistics.
+
+    `gt_dist` (recon-point -> GT distance) defaults to nearest-point over `gt_points`; pass a
+    point-to-surface fn (see `build_gt` on a mesh) for the fairer accuracy metric.
+    """
+    d_acc = gt_dist(points) if gt_dist is not None else cKDTree(gt_points).query(points, k=1)[0]  # recon -> GT
     d_comp = cKDTree(points).query(gt_points, k=1)[0]  # GT -> recon
 
     metrics: dict = {
@@ -149,7 +173,7 @@ def build_provider(args, data: GtsfmData):
     return None
 
 
-def mode_records(data: GtsfmData, provider, gt_tree: cKDTree, to_world) -> tuple[list[dict], set[int]]:
+def mode_records(data: GtsfmData, provider, gt_dist, to_world) -> tuple[list[dict], set[int]]:
     """Walk measurements once: per ambiguous measurement, did BA converge to the GT-closer depth mode?
 
     Returns the per-measurement records and the set of tracks with >=1 ambiguous measurement.
@@ -170,8 +194,9 @@ def mode_records(data: GtsfmData, provider, gt_tree: cKDTree, to_world) -> tuple
             z = float(cam.pose().transformTo(point_w)[2])  # converged camera-frame Z
             opt_mode = 2 if abs(z - sample.depth_alt) < abs(z - sample.depth) else 1
             uv2 = gtsam.Point2(float(uv[0]), float(uv[1]))
-            dist_d = float(gt_tree.query(to_world(cam.backproject(uv2, sample.depth)))[0])
-            dist_alt = float(gt_tree.query(to_world(cam.backproject(uv2, sample.depth_alt)))[0])
+            dists = gt_dist(np.array([to_world(cam.backproject(uv2, sample.depth)),
+                                      to_world(cam.backproject(uv2, sample.depth_alt))]))
+            dist_d, dist_alt = float(dists[0]), float(dists[1])
             records.append({
                 "gap": abs(sample.depth - sample.depth_alt),
                 "opt_mode": opt_mode,
@@ -208,12 +233,12 @@ def summarize_modes(records: list[dict], tau: float) -> dict:
     }
 
 
-def subset_metrics(data: GtsfmData, track_ids: set[int], to_world, gt_points: np.ndarray, taus: list[float]) -> dict:
+def subset_metrics(data: GtsfmData, track_ids: set[int], to_world, gt_points: np.ndarray, taus: list[float], gt_dist) -> dict:
     """Global geometry metrics restricted to the ambiguous-track subset."""
     if not track_ids:
         return {"n_points": 0}
     pts = np.array([to_world(data.get_track(j).point3()) for j in sorted(track_ids)])
-    return evaluate_points(pts, gt_points, taus)
+    return evaluate_points(pts, gt_points, taus, gt_dist)
 
 
 def main() -> None:
@@ -248,16 +273,15 @@ def main() -> None:
     to_world = build_to_world(args.align_mode, args.align_ref, wTi_list, img_fnames)
     points = np.array([to_world(p) for p in points])
 
-    gt_points = load_gt_points(args.gt_ply)
-    metrics = evaluate_points(points, gt_points, args.tau)
+    gt_points, gt_dist = build_gt(args.gt_ply)  # point-to-surface accuracy for a mesh PLY
+    metrics = evaluate_points(points, gt_points, args.tau, gt_dist)
 
     if args.depth_map_dir or args.depth_npz:
         data = GtsfmData.read_colmap(args.sfm_output)
         provider = build_provider(args, data)
-        gt_tree = cKDTree(gt_points)
-        records, ambiguous_tracks = mode_records(data, provider, gt_tree, to_world)
+        records, ambiguous_tracks = mode_records(data, provider, gt_dist, to_world)
         metrics["modes"] = summarize_modes(records, args.mode_tau)
-        metrics["ambiguous_subset"] = subset_metrics(data, ambiguous_tracks, to_world, gt_points, args.tau)
+        metrics["ambiguous_subset"] = subset_metrics(data, ambiguous_tracks, to_world, gt_points, args.tau, gt_dist)
 
     out_path = Path(args.out) if args.out else Path(args.sfm_output).parent / "geometry_metrics.json"
     out_path.write_text(json.dumps(metrics, indent=2))

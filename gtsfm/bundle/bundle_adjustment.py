@@ -755,9 +755,7 @@ class BundleAdjustmentOptimizer:
         if self._depth_gt_ply is None or self._depth_gt_align_ref is None or self._image_fnames is None:
             logger.warning("depth_gt_gate set but missing ply / align_ref / image_fnames; skipping GT gate.")
             return None
-        from scipy.spatial import cKDTree
-
-        from gtsfm.evaluation.eval_geometry import _gt_poses_from_colmap, load_gt_points, sim3_align
+        from gtsfm.evaluation.eval_geometry import _gt_poses_from_colmap, sim3_align
 
         # _gt_poses_from_colmap expects a list whose position == camera index (matches wTi_list);
         # convert the {idx: name} map, filling gaps with "" so missing slots are skipped, not crash.
@@ -775,24 +773,48 @@ class BundleAdjustmentOptimizer:
         except (ValueError, KeyError) as exc:
             logger.warning("GT gate: alignment failed (%s); skipping GT gate.", exc)
             return None
-        gt_tree = cKDTree(load_gt_points(self._depth_gt_ply))
+        # Distance query against the GT geometry. A mesh (e.g. ETH3D occlusion/surface_mesh.ply) gives
+        # true point-to-SURFACE distance via raycasting; a point cloud falls back to nearest-point,
+        # which OVERESTIMATES distance near the surface (gating out modes that are really on it). Prefer
+        # the mesh.
+        import open3d as o3d
+
+        o3d_mesh = o3d.io.read_triangle_mesh(self._depth_gt_ply)
+        if len(o3d_mesh.triangles) > 0:
+            scene = o3d.t.geometry.RaycastingScene()
+            scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(o3d_mesh))
+
+            def dist_fn(pts: np.ndarray) -> np.ndarray:
+                return scene.compute_distance(o3d.core.Tensor(np.asarray(pts, dtype=np.float32))).numpy()
+
+            ref = "mesh surface"
+        else:
+            from scipy.spatial import cKDTree
+
+            from gtsfm.evaluation.eval_geometry import load_gt_points
+
+            tree = cKDTree(load_gt_points(self._depth_gt_ply))
+
+            def dist_fn(pts: np.ndarray) -> np.ndarray:
+                return tree.query(np.asarray(pts))[0]
+
+            ref = "point cloud"
         logger.info(
-            "GT gate: recon->world scale=%.4f, camera RMS=%.4f m, tau=%.3f m, oracle_select=%s",
-            wSr.scale(), rms, self._depth_gt_tau, self._depth_gt_oracle_select,
+            "GT gate: %s, recon->world scale=%.4f, camera RMS=%.4f m, tau=%.3f m, oracle_select=%s",
+            ref, wSr.scale(), rms, self._depth_gt_tau, self._depth_gt_oracle_select,
         )
-        return gt_tree, (lambda p: np.array(wSr.transformFrom(np.asarray(p, dtype=float)))), float(wSr.scale())
+        return dist_fn, (lambda p: np.asarray(wSr.transformFrom(np.asarray(p, dtype=float)))), float(wSr.scale())
 
     def __gt_gate_modes(self, cam, uv, modes, gate) -> Tuple[bool, Optional[float]]:
-        """Is any mode within tau of the GT cloud? Returns (keep, GT-closest mode)."""
-        gt_tree, to_world, scale = gate
-        best_mode, best_dist = None, float("inf")
-        for d in modes:
-            if d is None or d <= 0.0:
-                continue
-            dist = float(gt_tree.query(to_world(cam.backproject(uv, float(d) / scale)))[0])
-            if dist < best_dist:
-                best_dist, best_mode = dist, float(d)
-        return best_dist < self._depth_gt_tau, best_mode
+        """Is any mode within tau of the GT geometry? Returns (keep, GT-closest mode)."""
+        dist_fn, to_world, scale = gate
+        valid = [float(d) for d in modes if d is not None and d > 0.0]
+        if not valid:
+            return False, None
+        world_pts = np.array([to_world(cam.backproject(uv, d / scale)) for d in valid])
+        dists = dist_fn(world_pts)
+        k = int(np.argmin(dists))
+        return float(dists[k]) < self._depth_gt_tau, valid[k]
 
     def __depth_factors(self, initial_data: GtsfmData, cameras_to_model: List[int]) -> NonlinearFactorGraph:
         """Generate camera-frame-Z depth factors for track measurements.
