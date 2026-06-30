@@ -40,7 +40,7 @@ OUT="$SCRATCH/logs/sweeps/${SWEEP}/${SEQ}/${MODE}"
 GT="$DATA/$SEQ/${SEQ}_gt.ply"
 COLMAP_DIR="$DATA/$SEQ/dslr_calibration_undistorted"
 IMAGES_DIR="$DATA/$SEQ/images"
-DEPTH_DIR="$DATA/$SEQ/depth_pro_760"
+DEPTH_DIR="$DATA/$SEQ/${DEPTH_SUBDIR:-depth_pro_760}"   # set DEPTH_SUBDIR=gt_depth_760 for the GT-depth-as-source oracle
 
 echo "GIT_COMMIT=${GIT_COMMIT:?GIT_COMMIT is not set. Use 'cluv submit' to submit this job script.}"
 cd $SLURM_TMPDIR
