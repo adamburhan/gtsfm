@@ -30,6 +30,7 @@ AUTO_SCALE=${AUTO_SCALE:-true}   # reconcile metric depth with recon scale; need
 GT_GATE=${GT_GATE:-true}        # oracle diagnostic: drop depth factors whose modes all miss the GT surface
 GT_TAU=${GT_TAU:-0.1}           # gate band (m): a mode this close to GT counts as valid
 GT_ORACLE=${GT_ORACLE:-false}    # also collapse to the GT-closest mode (mode-selection ceiling)
+PATCH_RADIUS=${PATCH_RADIUS:-3}  # half-size of the patch for gap/GMM ambiguity analysis
 
 project_name="gtsfm"
 project_root="$HOME/repos/$project_name"
@@ -70,13 +71,14 @@ fi
 
 BA="cluster_optimizer.multiview_optimizer.bundle_adjustment_module"
 
-# Depth source shared by all bimodal modes. The template's braces are single-quoted so Hydra reads
-# it as a literal string (DSC_6487.JPG -> DSC_6487.npy). depth_scale=1 (float meters); depth_auto_scale
-# reconciles metric depth with the arbitrary classical-SfM scale.
+# Depth source shared by all bimodal modes. template=null mirrors the exact image stem with depth_ext
+# (DSC_0675.JPG -> DSC_0675.npy), preserving leading zeros (an integer template would drop them).
+# depth_scale=1 (float meters); depth_auto_scale reconciles metric depth with the classical-SfM scale.
 DEPTH_COMMON="$BA.depth_map_dir=$DEPTH_DIR \
-    $BA.depth_filename_template='DSC_{}.npy' \
+    $BA.depth_filename_template=null $BA.depth_ext=.npy \
     $BA.depth_scale=1.0 $BA.depth_auto_scale=$AUTO_SCALE \
     $BA.depth_min=0.1 $BA.depth_max=100.0 $BA.depth_gap_thresh=$GAPTHRESH \
+    $BA.depth_patch_radius=$PATCH_RADIUS \
     $BA.depth_gt_gate=$GT_GATE $BA.depth_gt_ply=$GT $BA.depth_gt_align_ref=$COLMAP_DIR \
     $BA.depth_gt_tau=$GT_TAU $BA.depth_gt_oracle_select=$GT_ORACLE"
 

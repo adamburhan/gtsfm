@@ -313,6 +313,7 @@ class BundleAdjustmentOptions:
     depth_max: float = 20.0
     depth_scale: float = 1.0
     depth_filename_template: Optional[str] = "depth{:06d}.png"
+    depth_ext: str = ".png"  # used when depth_filename_template is null: depth file = <image-stem><depth_ext>
     depth_patch_radius: int = 5
     depth_gap_thresh: float = 0.15
     depth_ambiguity_thresh: float = 0.20
@@ -367,6 +368,7 @@ class BundleAdjustmentOptions:
             depth_max=self.depth_max,
             depth_scale=self.depth_scale,
             depth_filename_template=self.depth_filename_template,
+            depth_ext=self.depth_ext,
             depth_patch_radius=self.depth_patch_radius,
             depth_gap_thresh=self.depth_gap_thresh,
             depth_ambiguity_thresh=self.depth_ambiguity_thresh,
@@ -444,6 +446,7 @@ class BundleAdjustmentOptimizer:
         depth_max: float = 20.0,
         depth_scale: float = 1.0,
         depth_filename_template: Optional[str] = "depth{:06d}.png",
+        depth_ext: str = ".png",
         depth_patch_radius: int = 5,
         depth_gap_thresh: float = 0.15,
         depth_ambiguity_thresh: float = 0.20,
@@ -548,6 +551,7 @@ class BundleAdjustmentOptimizer:
         self._depth_max = depth_max
         self._depth_scale = depth_scale
         self._depth_filename_template = depth_filename_template
+        self._depth_ext = depth_ext
         self._depth_patch_radius = depth_patch_radius
         self._depth_gap_thresh = depth_gap_thresh
         self._depth_ambiguity_thresh = depth_ambiguity_thresh
@@ -677,6 +681,7 @@ class BundleAdjustmentOptimizer:
                 depth_max=self._depth_max,
                 depth_scale=self._depth_scale,
                 depth_filename_template=self._depth_filename_template,
+                depth_ext=self._depth_ext,
                 compute_hypotheses=compute_hypotheses,
                 patch_radius=self._depth_patch_radius,
                 gap_thresh=self._depth_gap_thresh,

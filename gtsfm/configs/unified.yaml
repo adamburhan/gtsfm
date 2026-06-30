@@ -117,6 +117,7 @@ cluster_optimizer:
       depth_max: 20.0
       depth_scale: 1.0
       depth_filename_template: "depth{:06d}.png"
+      depth_ext: ".png"               # used when depth_filename_template is null: depth = <image-stem><depth_ext>
       # Ambiguity / second-hypothesis detection (used by drop_ambiguous and bimodal).
       depth_patch_radius: 5
       depth_gap_thresh: 0.15
