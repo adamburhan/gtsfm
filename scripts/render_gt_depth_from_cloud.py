@@ -4,6 +4,7 @@
 import argparse
 from pathlib import Path
 
+import cv2
 import numpy as np
 import trimesh
 
@@ -17,6 +18,8 @@ def main() -> None:
     ap.add_argument("--colmap_dir", required=True, help="Undistorted COLMAP dir (dslr_calibration_undistorted)")
     ap.add_argument("--out_dir", required=True, help="Output dir for loader-resolution GT depth .npy")
     ap.add_argument("--max_resolution", type=int, default=760, help="Must match the GTSfM loader --max_resolution")
+    ap.add_argument("--median_ksize", type=int, default=5, choices=[1, 3, 5],
+                    help="Median filter to clean z-buffer scatter/foreground spikes (1=off; cv2 float supports 3/5)")
     args = ap.parse_args()
 
     geo = trimesh.load(args.gt_ply, process=False)
@@ -50,6 +53,16 @@ def main() -> None:
         order = np.argsort(-z)
         depth[row[order] * new_w + col[order]] = z[order]
         depth = depth.reshape(new_h, new_w)
+
+        # Median-filter to remove z-buffer scatter / isolated stray-foreground points (a single near
+        # outlier in a window of correct depths is replaced by the median). Holes are a large sentinel
+        # so they don't bias the median; all-hole windows stay holes.
+        if args.median_ksize > 1:
+            sentinel = np.float32(1e9)
+            filled = np.where(np.isfinite(depth), depth, sentinel).astype(np.float32)
+            filled = cv2.medianBlur(filled, args.median_ksize)
+            depth = np.where(filled < sentinel * 0.5, filled, np.nan).astype(np.float32)
+
         valid = float(np.isfinite(depth).mean())
         depth[~np.isfinite(depth)] = np.nan
         np.save(out_dir / (Path(fname).stem + ".npy"), depth)
