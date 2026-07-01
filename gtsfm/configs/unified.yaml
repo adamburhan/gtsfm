@@ -133,6 +133,7 @@ cluster_optimizer:
       depth_gt_align_ref: null        # COLMAP GT-pose dir for the gate (eval_geometry --align_ref)
       depth_gt_tau: 0.05              # gate band: a mode this close to GT (m) counts as valid
       depth_gt_oracle_select: false   # also collapse to the GT-closest mode (mode-selection ceiling)
+      depth_gt_scale: false           # fix sf to the GT Sim(3) scale even when gating is off (removes the auto_scale confound)
 
   # comment out to not run
   dense_multiview_optimizer:
