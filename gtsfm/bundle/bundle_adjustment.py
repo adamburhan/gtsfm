@@ -865,17 +865,20 @@ class BundleAdjustmentOptimizer:
         if depth_provider is None:
             return graph
 
-        depth_noise = Isotropic.Sigma(1, self._depth_factor_sigma)
-        unit_noise = Isotropic.Sigma(1, 1.0)  # mixture factor whitens by its own per-mode sigma
-        if self._depth_factor_robust_loss:
-            depth_noise = Robust(mEstimator.Huber(self._robust_noise_basin), depth_noise)
-            unit_noise = Robust(mEstimator.Huber(self._robust_noise_basin), unit_noise)
-
         # GT null-hypothesis gate (oracle diagnostic): drop factors whose modes all miss the GT surface.
         gate = self.__build_gt_gate(initial_data, cameras_to_model)
 
         # Scale mapping metric depth into the gauge-arbitrary recon frame (a separate concern from the gate).
         sf = self.__depth_scale(initial_data, cameras_to_model, depth_provider, gate)
+
+        # Noise models. depth_factor_sigma is a METRIC (meters) sigma; the residual is in recon units
+        # (z_pred - d/sf), so whiten by sigma/sf — matching the mixture path, which divides its per-mode
+        # sigmas by sf. unit_noise is scale-free: the mixture factor whitens by its own per-mode sigma.
+        depth_noise = Isotropic.Sigma(1, self._depth_factor_sigma / sf)
+        unit_noise = Isotropic.Sigma(1, 1.0)
+        if self._depth_factor_robust_loss:
+            depth_noise = Robust(mEstimator.Huber(self._robust_noise_basin), depth_noise)
+            unit_noise = Robust(mEstimator.Huber(self._robust_noise_basin), unit_noise)
 
         n_unimodal = 0
         n_bimodal = 0
