@@ -26,6 +26,7 @@ GT_POSES=false                     # false = real from-scratch SfM (gauge-free);
 GT_TAU=0.1                         # gate band (m): a mode this close to GT counts as valid
 GT_ORACLE=false                    # also collapse to the GT-closest mode (mode-selection ceiling)
 PATCH_RADIUS=3                     # half-size of the patch for gap/GMM ambiguity analysis
+GS_STEPS=7000                      # Gaussian-splatting training steps for the NVS eval
 
 project_name="gtsfm"
 project_root="$HOME/repos/$project_name"
@@ -88,7 +89,7 @@ case "$MODE" in
     *) echo "unknown mode: $MODE" >&2; exit 1 ;;
 esac
 
-echo "=== [1/2] GTSfM (unified/classical): seq=$SEQ mode=$MODE gap=$GAPTHRESH max_res=$MAX_RES gt_poses=$GT_POSES auto_scale=$AUTO_SCALE gt_gate=$GT_GATE oracle=$GT_ORACLE gt_scale=$GT_SCALE ==="
+echo "=== [1/3] GTSfM (unified/classical): seq=$SEQ mode=$MODE gap=$GAPTHRESH max_res=$MAX_RES gt_poses=$GT_POSES auto_scale=$AUTO_SCALE gt_gate=$GT_GATE oracle=$GT_ORACLE gt_scale=$GT_SCALE ==="
 uv run python -m gtsfm.runner \
     --config_name unified.yaml \
     --correspondence_generator_config_name sift \
@@ -109,7 +110,7 @@ else
     SFM="$OUT/results/ba_output"
 fi
 
-echo "=== [2/2] Geometry eval vs GT scan ($SFM) ==="
+echo "=== [2/3] Geometry eval vs GT scan ($SFM) ==="
 uv run python gtsfm/evaluation/eval_geometry.py \
     --sfm_output $SFM \
     --align_mode eth3d \
@@ -117,5 +118,19 @@ uv run python gtsfm/evaluation/eval_geometry.py \
     --gt_ply $GT_MESH \
     --tau 0.01 0.02 0.05 0.1 0.2 0.5 \
     --out $OUT/geometry_metrics.json
+
+echo "=== [3/3] Gaussian splatting + NVS eval (PSNR/SSIM/LPIPS on held-out views) ==="
+uv run python scripts/gaussian_splatting/custom_trainer.py default \
+    --data_dir $SFM \
+    --images_dir $IMAGES_DIR \
+    --init_type sfm \
+    --max_steps $GS_STEPS \
+    --result_dir $OUT/gs
+
+# Keep only the NVS stats JSON (aggregate_modes reads gs/stats/val_step*.json); GS checkpoints/ply/
+# renders are ~850MB/run and regenerable. Set KEEP_GS_ARTIFACTS=1 (edit here) to retain them.
+if [ "${KEEP_GS_ARTIFACTS:-0}" != "1" ]; then
+    find "$OUT/gs" -mindepth 1 -maxdepth 1 ! -name stats -exec rm -rf {} + 2>/dev/null || true
+fi
 
 echo "Done. Results in $OUT"
