@@ -1502,6 +1502,16 @@ class BundleAdjustmentOptimizer:
 
         return optimized_data, filtered_result, cumulative_valid_mask, step_times  # type: ignore
 
+    def __stamp_image_fnames(self, data: Optional[GtsfmData]) -> None:
+        """Write the real per-image filenames (from `self._image_fnames`) onto a BA result's
+        image_info, so the COLMAP export uses actual names instead of placeholders. Only valid
+        cameras in `data` are stamped; no-op if filenames were not provided."""
+        if data is None or self._image_fnames is None:
+            return
+        for i in data.get_valid_camera_indices():
+            if i in self._image_fnames:
+                data.set_image_info(i, name=self._image_fnames[i])
+
     def _run_ba_and_evaluate(
         self,
         initial_data: GtsfmData,
@@ -1596,6 +1606,17 @@ class BundleAdjustmentOptimizer:
                 step_times.append(time.time() - retri_start)
 
         total_time = time.time() - start_time
+
+        # Stamp the real (loader-relative) image filenames onto the BA outputs. The GtsfmData flowing
+        # through data association -> BA carries no names (they are threaded separately via
+        # `image_fnames`, used only for depth). Downstream, ClusterMVO annotates ba_output via
+        # clone_with_image_data, but that only fills the *basename* (Image.file_name), which drops any
+        # image subdirectory -- so nested layouts (e.g. ETH3D's images/dslr_images_undistorted/*.JPG)
+        # no longer resolve against --images_dir, while flat layouts (Replica results/frameNNN.jpg)
+        # happened to work. Stamping the full loader-relative name here (before that annotation, which
+        # is a no-op once name is set) fixes both. VGGT/deep front-ends set names via the tracker.
+        self.__stamp_image_fnames(optimized_data)
+        self.__stamp_image_fnames(filtered_result)
 
         metrics = self.evaluate(optimized_data, filtered_result, cameras_gt, save_dir)  # type: ignore
         for i, step_time in enumerate(step_times):
