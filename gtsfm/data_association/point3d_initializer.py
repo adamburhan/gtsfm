@@ -19,6 +19,7 @@ import gtsfm.common.types as gtsfm_types
 import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.reprojection as reproj_utils
 from gtsfm.common.sfm_track import SfmTrack2d
+from gtsfm.utils.determinism import RANSAC_SEED
 
 NUM_SAMPLES_PER_RANSAC_HYPOTHESIS = 2
 SVD_DLT_RANK_TOL = 1e-9
@@ -335,7 +336,10 @@ class Point3dInitializer:
             TriangulationSamplingMode.RANSAC_SAMPLE_UNIFORM,
             TriangulationSamplingMode.RANSAC_SAMPLE_BIASED_BASELINE,
         ]:
-            sample_indices = np.random.choice(
+            # Local fixed-seed generator so hypothesis sampling is reproducible regardless of the
+            # (worker-dependent) order in which tracks are triangulated. Global np.random is shared
+            # across parallel Dask tasks and would make this call order-dependent.
+            sample_indices = np.random.default_rng(RANSAC_SEED).choice(
                 len(scores),
                 size=num_hypotheses,
                 replace=False,

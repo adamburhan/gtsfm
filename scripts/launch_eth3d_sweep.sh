@@ -13,7 +13,8 @@ set -e
 GAP=0.10
 S=scripts/unified_eth3d_depthpro_sweep.sh
 TABLE=eth3d_table        # shared parent root for all conditions (aggregate over this)
-SEQUENCES="kicker courtyard delivery_area electro facade meadow office terrace pipes playground relief relief_2 terrains"
+
+SEQUENCES="kicker delivery_area pipes relief relief_2 facade terrace terrains"
 DEPTHPRO=depth_pro_760
 GT=gt_depth_mesh_760
 
@@ -38,5 +39,5 @@ for SEQ in $SEQUENCES; do
     cluv submit mila $S -- $SEQ bimodal_gmm $GAP $TABLE/depthpro_deploy $DEPTHPRO false false true
 done
 
-# 20 jobs: 10 conditions x 2 scenes. Aggregate ALL into one table after they finish:
+# 10 conditions per scene. Aggregate ALL into one table after they finish:
 #   python scripts/aggregate_modes.py --root "$SCRATCH/logs/sweeps/$TABLE" --latex --out_dir tables/eth3d

@@ -8,6 +8,7 @@
 
 set -eo pipefail
 module load cuda/12.6.0
+export PYTHONHASHSEED=0   # deterministic set/dict-hash ordering (must be set before python starts)
 
 SEQ=${1:?usage: unified_eth3d_depthpro_sweep.sh <seq> <mode> <gap> <sweep_name> <depth_subdir> <gt_scale> <gt_gate> <auto_scale>}
 MODE=${2:?mode: none | unimodal | bimodal_gap | bimodal_gmm | bimodal_gmm_null}

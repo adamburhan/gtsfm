@@ -12,6 +12,7 @@ from gtsam.symbol_shorthand import X  # type: ignore
 
 import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metric_utils
+from gtsfm.utils.determinism import RANSAC_SEED
 
 logger = logger_utils.get_logger()
 
@@ -221,7 +222,9 @@ def sim3_from_Pose3s_robust(
         thresholds_deg=[5],
     )[0]
 
-    sample_pose_pairs = np.random.choice(
+    # Local fixed-seed generator: makes the robust Sim(3) reproducible across runs, including in the
+    # separate eval process (eval_geometry) and the BA GT gate/scale, which all call this.
+    sample_pose_pairs = np.random.default_rng(RANSAC_SEED).choice(
         len(aTi_list),
         size=max_num_hypotheses * 2,
         replace=True,

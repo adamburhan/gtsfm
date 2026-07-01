@@ -18,6 +18,7 @@ import numpy as np
 import gtsfm.utils.logger as logger_utils
 from gtsfm.common.keypoints import Keypoints
 from gtsfm.frontend.verifier.opencv_verifier_base import OpencvVerifierBase
+from gtsfm.utils.determinism import RANSAC_SEED
 
 RANSAC_SUCCESS_PROB = 0.999999
 RANSAC_MAX_ITERS = 1000000
@@ -71,6 +72,7 @@ class Ransac(OpencvVerifierBase):
             inlier_mask: boolean array of shape (N3,) indicating inlier matches.
         """
         K = np.eye(3)
+        cv2.setRNGSeed(RANSAC_SEED)  # reset per call so the estimate is independent of worker/pair order
         i2Ei1, inlier_mask = cv2.findEssentialMat(
             uv_norm_i1[match_indices[:, 0]],
             uv_norm_i2[match_indices[:, 1]],
@@ -100,6 +102,7 @@ class Ransac(OpencvVerifierBase):
             i2Fi1: Fundamental matrix, as 3x3 array.
             inlier_mask: Boolean array of shape (N3,) indicating inlier matches.
         """
+        cv2.setRNGSeed(RANSAC_SEED)  # reset per call so the estimate is independent of worker/pair order
         i2Fi1, inlier_mask = cv2.findFundamentalMat(
             keypoints_i1.extract_indices(match_indices[:, 0]).coordinates,
             keypoints_i2.extract_indices(match_indices[:, 1]).coordinates,

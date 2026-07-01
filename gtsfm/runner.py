@@ -16,6 +16,7 @@ import gtsfm.utils.logger as logger_utils
 from gtsfm.cluster_optimizer import Multiview
 from gtsfm.loader.configuration import add_loader_args, build_loader_overrides
 from gtsfm.utils.configuration import log_full_configuration
+from gtsfm.utils.determinism import register_determinism, set_deterministic
 
 dask_config.set({"distributed.scheduler.worker-ttl": None})
 
@@ -447,8 +448,10 @@ class GtsfmRunner:
 
     def run(self) -> None:
         """Just create the client and call scene optimizer."""
+        set_deterministic(0)  # seed main process; workers seeded via register_determinism below
         logger.info("🌟 GTSFM: Creating Dask client...")
         client = self._create_dask_client()
+        register_determinism(client, 0)  # seed every worker process (front-end nets + verifier RANSAC)
 
         logger.info("🌟 GTSFM: Constructing SceneOptimizer...")
         self.scene_optimizer = self._construct_scene_optimizer()
