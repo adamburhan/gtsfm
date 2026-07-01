@@ -158,11 +158,7 @@ def make_mixture_depth_factor(
 
     Null hypothesis (``null_nsigma``): when set, if even the *selected* mode is more than
     ``null_nsigma`` sigmas from the predicted depth, the factor opts out — it returns a zero residual
-    with a zero Jacobian, so only the reprojection factor constrains that measurement. This is the
-    Olson–Agarwal max-mixture null component: it lets BA reject depth where no candidate agrees with
-    the multi-view geometry, instead of being dragged toward the least-bad (still wrong) mode. A
-    hard-redescending gate — strictly stronger than a Huber loss, which keeps a constant tail pull.
-    Default ``None`` leaves behaviour unchanged.
+    with a zero Jacobian, so only the reprojection factor constrains that measurement. 
     """
     depths = np.asarray(depths, dtype=np.float64)
     sigmas = np.asarray(sigmas, dtype=np.float64)
@@ -171,12 +167,14 @@ def make_mixture_depth_factor(
     def error_func(this, values, H):
         pose_wTc = values.atPose3(pose_key)
         point_w = values.atPoint3(lm_key)
+
         H_pose = np.zeros((3, 6), dtype=np.float64, order="F")
         H_point = np.zeros((3, 3), dtype=np.float64, order="F")
+
         point_c = pose_wTc.transformTo(point_w, H_pose, H_point)
         z_pred = float(point_c[2])
         r = (z_pred - depths) / sigmas
-        k = int(np.argmin(0.5 * r * r + np.log(sigmas) - log_weights))
+        k = int(np.argmin(0.5 * r * r + np.log(sigmas))) # temporarily uniform prior
         if null_nsigma is not None and abs(r[k]) > null_nsigma:
             # Null hypothesis selected: no mode fits the geometry -> disable the depth term here.
             if H is not None:
@@ -334,6 +332,7 @@ class BundleAdjustmentOptions:
     depth_gt_align_ref: Optional[str] = None  # COLMAP GT dir (poses), as eval_geometry's --align_ref
     depth_gt_tau: float = 0.05
     depth_gt_oracle_select: bool = False  # also collapse to the GT-closest mode (mode-selection ceiling)
+    depth_gt_scale: bool = False  # use the GT Sim(3) scale for sf even when gating is off (removes the auto_scale confound)
 
     def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
         """Construct a :class:`BundleAdjustmentOptimizer` from these options.
@@ -386,6 +385,7 @@ class BundleAdjustmentOptions:
             depth_gt_align_ref=self.depth_gt_align_ref,
             depth_gt_tau=self.depth_gt_tau,
             depth_gt_oracle_select=self.depth_gt_oracle_select,
+            depth_gt_scale=self.depth_gt_scale,
         )
         kwargs.update(overrides)
         return BundleAdjustmentOptimizer(**kwargs)
@@ -464,6 +464,7 @@ class BundleAdjustmentOptimizer:
         depth_gt_align_ref: Optional[str] = None,
         depth_gt_tau: float = 0.05,
         depth_gt_oracle_select: bool = False,
+        depth_gt_scale: bool = False,
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -569,6 +570,7 @@ class BundleAdjustmentOptimizer:
         self._depth_gt_align_ref = depth_gt_align_ref
         self._depth_gt_tau = depth_gt_tau
         self._depth_gt_oracle_select = depth_gt_oracle_select
+        self._depth_gt_scale = depth_gt_scale
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
@@ -740,20 +742,42 @@ class BundleAdjustmentOptimizer:
         logger.info("Depth auto-scale: recon<-metric s=%.4f from %d samples.", s, len(log_ratios))
         return s
 
-    def __build_gt_gate(self, initial_data: GtsfmData, cameras_to_model: List[int]):
-        """Build the GT null-hypothesis gate, or None if disabled/unavailable.
+    def __depth_scale(
+        self, initial_data: GtsfmData, cameras_to_model: List[int], depth_provider: DepthProvider, gate
+    ) -> float:
+        """Scale ``sf`` mapping metric depth into the gauge-arbitrary recon frame (``d / sf``).
 
-        Aligns the current recon to the GT poses (same Sim(3) as the pose-AUC / geometry eval) and
-        loads the GT cloud into a KD-tree. Returns ``(gt_tree, to_world, scale)`` where ``to_world``
-        maps a recon point into the GT/world frame and ``scale`` is the recon->world factor, so a
-        metric mode ``d`` placed via ``to_world(cam.backproject(uv, d/scale))`` lands at its true
-        metric position. Reads GT poses straight from the COLMAP dir, so it works even when the
-        reconstruction itself used estimated (non-GT) extrinsics.
+        Classical SfM fixes scale only up to one global similarity, so metric depth must be divided
+        by ``sf`` before it can be compared to the recon-frame ``z_pred``. Preference order: the GT
+        Sim(3) geometric scale (from the gate, or from ``depth_gt_scale`` when gating is off), then the
+        point-ratio ``auto_scale``, then 1.0. The Sim(3) scale is robust; ``auto_scale`` is a median
+        over ALL modes and collapses when most are garbage (delivery_area: 92% bad -> recon shrank to
+        1/3). ``depth_gt_scale`` holds the scale fixed across conditions so a method isn't penalized by
+        a collapsed ``auto_scale`` — it removes the scale confound in the sweep table (oracle: needs GT).
         """
-        if not self._depth_gt_gate:
-            return None
-        if self._depth_gt_ply is None or self._depth_gt_align_ref is None or self._image_fnames is None:
-            logger.warning("depth_gt_gate set but missing ply / align_ref / image_fnames; skipping GT gate.")
+        if gate is not None:
+            sf = float(gate[2])
+            logger.info("Depth factor scale: using GT-gate geometric scale sf=%.4f.", sf)
+            return sf
+        if self._depth_gt_scale:
+            aln = self.__gt_sim3(initial_data, cameras_to_model)
+            if aln is not None:
+                sf = float(aln[0].scale())
+                logger.info("Depth factor scale: using GT Sim(3) scale sf=%.4f (ungated).", sf)
+                return sf
+            logger.warning("depth_gt_scale set but GT Sim(3) unavailable; falling back to auto_scale/1.0.")
+        if self._depth_auto_scale:
+            return self.__estimate_recon_metric_scale(initial_data, cameras_to_model, depth_provider)
+        return 1.0
+
+    def __gt_sim3(self, initial_data: GtsfmData, cameras_to_model: List[int]):
+        """Robust recon->GT Sim(3) ``(wSr, camera_rms_m)`` from GT poses, or None if unavailable.
+
+        Reads GT poses straight from the COLMAP dir (``depth_gt_align_ref``) and aligns them to the
+        current recon cameras (same Sim(3) as the pose-AUC / geometry eval), so it works even when the
+        reconstruction used estimated extrinsics. Shared by the GT gate and the GT-scale path.
+        """
+        if self._depth_gt_align_ref is None or self._image_fnames is None:
             return None
         from gtsfm.evaluation.eval_geometry import _gt_poses_from_colmap, sim3_align
 
@@ -769,39 +793,49 @@ class BundleAdjustmentOptimizer:
             if i in self._image_fnames:
                 img_fnames_list[i] = self._image_fnames[i]
         try:
-            wSr, rms = sim3_align(wTi_list, _gt_poses_from_colmap(self._depth_gt_align_ref, img_fnames_list))
+            return sim3_align(wTi_list, _gt_poses_from_colmap(self._depth_gt_align_ref, img_fnames_list))
         except (ValueError, KeyError) as exc:
-            logger.warning("GT gate: alignment failed (%s); skipping GT gate.", exc)
+            logger.warning("GT Sim(3): alignment failed (%s).", exc)
             return None
-        # Distance query against the GT geometry. A mesh (e.g. ETH3D occlusion/surface_mesh.ply) gives
-        # true point-to-SURFACE distance via raycasting; a point cloud falls back to nearest-point,
-        # which OVERESTIMATES distance near the surface (gating out modes that are really on it). Prefer
-        # the mesh.
+
+    def __build_gt_gate(self, initial_data: GtsfmData, cameras_to_model: List[int]):
+        """Build the GT null-hypothesis gate, or None if disabled/unavailable.
+
+        Aligns the current recon to the GT poses (same Sim(3) as the pose-AUC / geometry eval) and
+        loads the GT surface mesh into a raycasting scene. Returns ``(dist_fn, to_world, scale)`` where
+        ``to_world`` maps a recon point into the GT/world frame and ``scale`` is the recon->world factor, so a
+        metric mode ``d`` placed via ``to_world(cam.backproject(uv, d/scale))`` lands at its true
+        metric position. Reads GT poses straight from the COLMAP dir, so it works even when the
+        reconstruction itself used estimated (non-GT) extrinsics.
+        """
+        if not self._depth_gt_gate:
+            return None
+        if self._depth_gt_ply is None or self._depth_gt_align_ref is None or self._image_fnames is None:
+            logger.warning("depth_gt_gate set but missing ply / align_ref / image_fnames; skipping GT gate.")
+            return None
+        aln = self.__gt_sim3(initial_data, cameras_to_model)
+        if aln is None:
+            logger.warning("GT gate: alignment unavailable; skipping GT gate.")
+            return None
+        wSr, rms = aln
+        # Distance query against the GT surface mesh (e.g. ETH3D occlusion/surface_mesh.ply): true
+        # point-to-SURFACE distance via raycasting. The gate is only ever fed a mesh; if a non-mesh
+        # ply slips through, skip the gate rather than silently fall back to (biased) nearest-point.
         import open3d as o3d
 
         o3d_mesh = o3d.io.read_triangle_mesh(self._depth_gt_ply)
-        if len(o3d_mesh.triangles) > 0:
-            scene = o3d.t.geometry.RaycastingScene()
-            scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(o3d_mesh))
+        if len(o3d_mesh.triangles) == 0:
+            logger.warning("GT gate: %s has no triangles (not a surface mesh); skipping GT gate.", self._depth_gt_ply)
+            return None
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(o3d_mesh))
 
-            def dist_fn(pts: np.ndarray) -> np.ndarray:
-                return scene.compute_distance(o3d.core.Tensor(np.asarray(pts, dtype=np.float32))).numpy()
+        def dist_fn(pts: np.ndarray) -> np.ndarray:
+            return scene.compute_distance(o3d.core.Tensor(np.asarray(pts, dtype=np.float32))).numpy()
 
-            ref = "mesh surface"
-        else:
-            from scipy.spatial import cKDTree
-
-            from gtsfm.evaluation.eval_geometry import load_gt_points
-
-            tree = cKDTree(load_gt_points(self._depth_gt_ply))
-
-            def dist_fn(pts: np.ndarray) -> np.ndarray:
-                return tree.query(np.asarray(pts))[0]
-
-            ref = "point cloud"
         logger.info(
-            "GT gate: %s, recon->world scale=%.4f, camera RMS=%.4f m, tau=%.3f m, oracle_select=%s",
-            ref, wSr.scale(), rms, self._depth_gt_tau, self._depth_gt_oracle_select,
+            "GT gate: mesh surface, recon->world scale=%.4f, camera RMS=%.4f m, tau=%.3f m, oracle_select=%s",
+            wSr.scale(), rms, self._depth_gt_tau, self._depth_gt_oracle_select,
         )
         return dist_fn, (lambda p: np.asarray(wSr.transformFrom(np.asarray(p, dtype=float)))), float(wSr.scale())
 
@@ -840,17 +874,8 @@ class BundleAdjustmentOptimizer:
         # GT null-hypothesis gate (oracle diagnostic): drop factors whose modes all miss the GT surface.
         gate = self.__build_gt_gate(initial_data, cameras_to_model)
 
-        # Scale mapping metric depth into the recon frame. Prefer the gate's geometric (camera-based)
-        # Sim(3) scale when the gate is on: it is robust, whereas the point-ratio auto_scale is a median
-        # over ALL modes and collapses when most are garbage (delivery_area: 92% bad -> recon shrank to
-        # 1/3). Fall back to auto_scale, then 1.0.
-        if gate is not None:
-            sf = gate[2]
-            logger.info("Depth factor scale: using GT-gate geometric scale sf=%.4f.", sf)
-        elif self._depth_auto_scale:
-            sf = self.__estimate_recon_metric_scale(initial_data, cameras_to_model, depth_provider)
-        else:
-            sf = 1.0
+        # Scale mapping metric depth into the gauge-arbitrary recon frame (a separate concern from the gate).
+        sf = self.__depth_scale(initial_data, cameras_to_model, depth_provider, gate)
 
         n_unimodal = 0
         n_bimodal = 0

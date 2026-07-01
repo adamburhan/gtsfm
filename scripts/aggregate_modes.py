@@ -1,4 +1,4 @@
-"""Aggregate depth-factor modes into final per-dataset tables (geometry / NVS / pose).
+"""Aggregate depth-factor sweep runs into per-dataset tables (geometry / NVS / pose).
 
 Two ways to point it at runs:
   - single scene:  `none=DIR unimodal=DIR drop_ambiguous=DIR bimodal=DIR`
@@ -7,12 +7,12 @@ Two ways to point it at runs:
                    sequence is the path component above the mode (ignoring a 'modes' level).
 
 Per run dir it locates (shallowest match = the merged/top-level file):
-  - geometry_metrics.json            (global geometry + "modes" + "ambiguous_subset")
+  - geometry_metrics.json            (geometry accuracy/precision + "alignment": Sim(3) scale, camera RMS)
   - bundle_adjustment_metrics.json   (pose AUC, rotation/translation error)
   - gs/stats/val_step*.json          (latest-step PSNR / SSIM / LPIPS)
 
-Outputs an all-metrics CSV, prints the headline (Geometry|NVS|Pose) and mode-selection
-tables, and with --latex writes the paper table (seq x mode, category column groups).
+Outputs an all-metrics CSV, prints the diagnostic table (geometry cm | pose RMS | Sim(3) scale),
+and with --latex writes the paper table (seq x mode, category column groups, best-per-metric bolded).
 
 Examples:
     python scripts/aggregate_modes.py --root $ETH3D --latex --out_dir tables/eth3d
@@ -35,18 +35,36 @@ POSE_FILES = [
     ("bundle_adjustment_metrics.json", "bundle_adjustment_metrics"),
 ]
 NVS_KEYS = ["psnr", "ssim", "lpips", "num_GS"]
-MODE_KEYS = [
-    "n_ambiguous_measurements", "mode2_selected_frac", "mode_correct_frac", "mode2_correct_frac",
-    "primary_correct_frac", "bimodal_over_primary", "oracle_within_tau_frac",
-    "selection_cost_mean_m", "dist_selected_median_m",
+
+# Diagnostic per-scene table (printed + reference). (json_key, header, scale, precision).
+DIAG_COLS = [
+    ("n_points", "n", 1, 0),
+    ("accuracy_median_m", "median_cm", 100, 2),
+    ("accuracy_mean_m", "mean_cm", 100, 2),
+    ("accuracy_p95_m", "p95_cm", 100, 2),
+    ("precision@1cm", "prec@1cm", 1, 3),
+    ("precision@2cm", "prec@2cm", 1, 3),
+    ("precision@5cm", "prec@5cm", 1, 3),
+    ("camera_rms_m", "poseRMS_cm", 100, 2),
+    ("sim3_scale", "scale", 1, 4),
 ]
 
-# (json_key, latex_header, mm_scale, precision) for the paper table.
-GEOM_COLS = [("accuracy_median_m", r"acc$_{50}$", 1000, 1), ("accuracy_mean_m", r"acc$_{\mu}$", 1000, 1),
-             ("accuracy_p95_m", r"acc$_{95}$", 1000, 1)]
-NVS_COLS = [("psnr", "PSNR", 1, 2), ("ssim", "SSIM", 1, 3), ("lpips", "LPIPS", 1, 3)]
-POSE_COLS = [("pose_auc_@1.0_deg", r"@1\degree", 1, 3), ("pose_auc_@2.5_deg", r"@2.5\degree", 1, 3),
-             ("pose_auc_@5.0_deg", r"@5\degree", 1, 3)]
+# Paper table. (json_key, latex_header, scale, precision, direction) — direction picks best (min/max) to bold.
+GEOM_COLS = [
+    ("accuracy_median_m", r"acc$_{50}\downarrow$", 1000, 1, "min"),
+    ("accuracy_mean_m", r"acc$_{\mu}\downarrow$", 1000, 1, "min"),
+    ("accuracy_p95_m", r"acc$_{95}\downarrow$", 1000, 1, "min"),
+]
+NVS_COLS = [
+    ("psnr", r"PSNR$\uparrow$", 1, 2, "max"),
+    ("ssim", r"SSIM$\uparrow$", 1, 3, "max"),
+    ("lpips", r"LPIPS$\downarrow$", 1, 3, "min"),
+]
+POSE_COLS = [
+    ("pose_auc_@1.0_deg", r"@1$^\circ\uparrow$", 1, 3, "max"),
+    ("pose_auc_@2.5_deg", r"@2.5$^\circ\uparrow$", 1, 3, "max"),
+    ("pose_auc_@5.0_deg", r"@5$^\circ\uparrow$", 1, 3, "max"),
+]
 PAPER_COLS = GEOM_COLS + NVS_COLS + POSE_COLS
 
 
@@ -60,7 +78,7 @@ def _median(value):
 
 
 def collect(run_dir: Path) -> dict:
-    """Flat metric record for one run dir (geometry + ambiguous + modes + pose + nvs)."""
+    """Flat metric record for one run dir (geometry + alignment + pose + nvs)."""
     rec: dict = {}
     g = _find(run_dir, "geometry_metrics.json")
     if g:
@@ -68,16 +86,15 @@ def collect(run_dir: Path) -> dict:
         for k in ["n_points", "accuracy_median_m", "accuracy_mean_m", "accuracy_p95_m"]:
             rec[k] = geom.get(k)
         for k in sorted(geom):
-            if k.startswith(("precision@", "fscore@")):
+            if k.startswith(("precision@", "recall@", "fscore@")):
                 rec[k] = geom[k]
-        amb = geom.get("ambiguous_subset", {})
-        rec["amb_n_points"] = amb.get("n_points")
-        rec["amb_accuracy_median_m"] = amb.get("accuracy_median_m")
-        rec.update({k: geom.get("modes", {}).get(k) for k in MODE_KEYS})
+        alignment = geom.get("alignment", {})
+        rec["sim3_scale"] = alignment.get("sim3_scale")
+        rec["camera_rms_m"] = alignment.get("camera_rms_m")
     for fname, wrapper in POSE_FILES:
         b = _find(run_dir, fname)
         if b:
-            ba = json.loads(b.read_text())[wrapper]
+            ba = json.loads(b.read_text()).get(wrapper, {})
             rec.update({k: ba.get(k) for k in POSE_KEYS})
             rec["rot_err_median_deg"] = _median(ba.get("rotation_angle_error_deg"))
             rec["trans_err_median"] = _median(ba.get("translation_error_distance"))
@@ -106,26 +123,47 @@ def _fmt(v, scale, prec):
     return "---" if v is None or pd.isna(v) else f"{v * scale:.{prec}f}"
 
 
+def _best_value(series, scale, prec, direction):
+    """Best display value in a column (min/max over non-null, rounded to display precision), or None."""
+    vals = [round(v * scale, prec) for v in series if v is not None and not pd.isna(v)]
+    if not vals:
+        return None
+    return min(vals) if direction == "min" else max(vals)
+
+
+def _tex(s: str) -> str:
+    return s.replace("_", r"\_")
+
+
 def latex_table(df: pd.DataFrame, caption: str, label: str) -> str:
     seqs = sorted(df["seq"].unique())
     rows = [
-        r"\begin{table}[h]", r"\centering", r"\small", r"\setlength{\tabcolsep}{4pt}",
+        r"\providecommand{\best}[1]{\textbf{#1}}",
+        r"\begin{table*}[t]", r"\centering", r"\scriptsize", r"\setlength{\tabcolsep}{3.2pt}",
         r"\begin{tabular}{ll" + "rrr" * 3 + "}", r"\toprule",
-        r" & & \multicolumn{3}{c}{Geometry} & \multicolumn{3}{c}{NVS} & \multicolumn{3}{c}{Pose AUC} \\",
+        r" & & \multicolumn{3}{c}{Geometry (mm) $\downarrow$} & \multicolumn{3}{c}{NVS} "
+        r"& \multicolumn{3}{c}{Pose AUC $\uparrow$} \\",
         r"\cmidrule(lr){3-5}\cmidrule(lr){6-8}\cmidrule(lr){9-11}",
-        "Seq. & Mode & " + " & ".join(h for _, h, _, _ in PAPER_COLS) + r" \\", r"\midrule",
+        "Seq. & Mode & " + " & ".join(h for _, h, _, _, _ in PAPER_COLS) + r" \\", r"\midrule",
     ]
     for si, seq in enumerate(seqs):
         if si:
             rows.append(r"\midrule")
         sub = df[df["seq"] == seq]
         modes = [m for m in MODE_ORDER if m in set(sub["mode"])]
+        best = {k: _best_value(sub[k], scale, prec, direction)
+                for k, _, scale, prec, direction in PAPER_COLS if k in sub.columns}
         for mi, mode in enumerate(modes):
             r = sub[sub["mode"] == mode].iloc[0]
-            cells = [_fmt(r.get(k), scale, prec) for k, _, scale, prec in PAPER_COLS]
-            first = r"\multirow{%d}{*}{%s}" % (len(modes), seq) if mi == 0 else ""
-            rows.append(f"{first} & {mode} & " + " & ".join(cells) + r" \\")
-    rows += [r"\bottomrule", r"\end{tabular}", f"\\caption{{{caption}}}", f"\\label{{{label}}}", r"\end{table}"]
+            cells = []
+            for k, _, scale, prec, _ in PAPER_COLS:
+                s = _fmt(r.get(k), scale, prec)
+                if s != "---" and best.get(k) is not None and round(r[k] * scale, prec) == best[k]:
+                    s = r"\best{%s}" % s
+                cells.append(s)
+            first = r"\multirow{%d}{*}{%s}" % (len(modes), _tex(seq)) if mi == 0 else ""
+            rows.append(f"{first} & {_tex(mode)} & " + " & ".join(cells) + r" \\")
+    rows += [r"\bottomrule", r"\end{tabular}", f"\\caption{{{caption}}}", f"\\label{{{label}}}", r"\end{table*}"]
     return "\n".join(rows)
 
 
@@ -135,7 +173,14 @@ def main() -> None:
     parser.add_argument("--root", default=None, help="Discover <seq>/<mode>/ runs under this dir (whole dataset).")
     parser.add_argument("--out_dir", default=".", help="Where to write CSV / .tex.")
     parser.add_argument("--latex", action="store_true", help="Also write the paper table (seq x mode).")
-    parser.add_argument("--caption", default="Sweep results.", help="LaTeX caption.")
+    parser.add_argument(
+        "--caption",
+        default=(
+            "Depth-factor sweep on ETH3D. Geometry in millimetres; arrows show the preferred direction "
+            "(lower for geometry/LPIPS, higher for PSNR/SSIM/pose AUC). Best per sequence and metric is bolded."
+        ),
+        help="LaTeX caption.",
+    )
     parser.add_argument("--label", default="tab:sweep", help="LaTeX label.")
     args = parser.parse_args()
 
@@ -160,13 +205,11 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_dir / "all_metrics.csv", index=False)
 
-    main_cols = ["seq", "mode"] + [k for k, *_ in PAPER_COLS if k in df.columns]
-    print("\n== Geometry | NVS | Pose (headline) ==")
-    print(df[main_cols].round(4).to_markdown(index=False))
-    mode_cols = ["seq", "mode"] + [k for k in MODE_KEYS if k in df.columns]
-    if df[[k for k in MODE_KEYS if k in df.columns]].notna().any().any():
-        print("\n== Mode-selection (contribution) ==")
-        print(df[mode_cols].round(4).to_markdown(index=False))
+    disp = pd.DataFrame({"seq": df["seq"], "mode": df["mode"]})
+    for key, header, scale, prec in DIAG_COLS:
+        disp[header] = df[key].map(lambda v: _fmt(v, scale, prec)) if key in df.columns else "---"
+    print("\n== Diagnostic table (geometry cm | pose RMS cm | Sim(3) scale) ==")
+    print(disp.to_markdown(index=False))
 
     if args.latex:
         tex_path = out_dir / "paper_table.tex"

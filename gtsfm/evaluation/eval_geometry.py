@@ -1,7 +1,9 @@
 """Evaluate a sparse reconstruction against ground-truth scene geometry.
 
-Point-based metrics (Tanks & Temples protocol): accuracy/precision@tau, completeness/recall@tau,
-F-score@tau, and point-to-GT distance percentiles.
+Geometry (Tanks & Temples protocol): accuracy/precision@tau, completeness/recall@tau, F-score@tau,
+and point-to-GT-surface distance percentiles (true point-to-surface distance for a mesh GT).
+(Camera-pose metrics come from bundle_adjustment_metrics.json; NVS / 3DGS metrics are evaluated
+separately.)
 
 Authors: Adam Burhan
 """
@@ -18,8 +20,6 @@ import trimesh.sample
 from scipy.spatial import cKDTree
 
 import gtsfm.utils.io as io_utils
-from gtsfm.common.depth_provider import DepthProvider
-from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.utils import align
 
 N_GT_SAMPLES = 1_000_000
@@ -119,126 +119,24 @@ def evaluate_points(points: np.ndarray, gt_points: np.ndarray, taus: list[float]
         metrics[f"fscore@{key}"] = f_score
     return metrics
 
+
 def build_to_world(align_mode: str, align_ref, wTi_list, img_fnames):
-    """Return f(point)->point mapping a recon point into the GT/world frame (same alignment as pose-AUC)."""
+    """Map recon points into the GT/world frame. Returns (to_world, alignment).
+
+    `alignment` is `{"sim3_scale", "camera_rms_m"}` for the pose modes (replica/eth3d) — byproducts of
+    the recon->GT Sim(3) fit, surfaced for the metrics JSON — and None for none/tnt (no Sim(3) fit).
+    """
     if align_mode == "none":
-        return lambda p: np.asarray(p, dtype=float)
+        return (lambda p: np.asarray(p, dtype=float)), None
     if align_mode == "tnt":
         T = np.loadtxt(align_ref).reshape(4, 4)
         R, t = T[:3, :3], T[:3, 3]
-        return lambda p: np.asarray(p, dtype=float) @ R.T + t
+        return (lambda p: np.asarray(p, dtype=float) @ R.T + t), None
     load_poses = _gt_poses_from_traj if align_mode == "replica" else _gt_poses_from_colmap
     wSr, rms_m = sim3_align(wTi_list, load_poses(align_ref, img_fnames))
     print(f"recon->world Sim(3): scale={wSr.scale():.6f}, camera-center RMS={rms_m:.4f} m")
-    return lambda p: np.array(wSr.transformFrom(np.asarray(p, dtype=float)))
-
-
-def build_image_fnames(data: GtsfmData) -> dict[int, str]:
-    out = {}
-    for i in data.get_valid_camera_indices():
-        info = data.get_image_info(i)
-        if info is not None and info.name:
-            out[i] = info.name
-    return out
-
-
-def _load_depth_npz(path: str, data: GtsfmData) -> dict[int, np.ndarray]:
-    """Load a node's depth.npz, re-keyed to read_colmap's 0-based sorted-filename order."""
-    raw = np.load(path)
-    arrays = {int(k): raw[k] for k in raw.keys()}
-    global_keys = sorted(arrays)
-    n_cams = len(data.get_valid_camera_indices())
-    if n_cams != len(global_keys):
-        raise ValueError(f"{n_cams} recon cams != {len(global_keys)} depth cams; cannot align indices.")
-    return {local: arrays[g] for local, g in enumerate(global_keys)}
-
-
-def build_provider(args, data: GtsfmData):
-    """DepthProvider from on-disk maps (--depth_map_dir) or in-memory VGGT depth (--depth_npz), else None."""
-    if args.depth_map_dir and args.depth_npz:
-        raise ValueError("Pass only one of --depth_map_dir / --depth_npz.")
-    if args.depth_npz:
-        return DepthProvider(
-            depth_arrays=_load_depth_npz(args.depth_npz, data),
-            depth_min=args.depth_min, depth_max=args.depth_max, compute_hypotheses=True,
-            patch_radius=args.patch_radius, gap_thresh=args.gap_thresh, ambiguity_thresh=0.0, min_valid=args.min_valid,
-        )
-    if args.depth_map_dir:
-        return DepthProvider(
-            depth_map_dir=args.depth_map_dir, image_fnames=build_image_fnames(data),
-            depth_scale=args.depth_scale, depth_filename_template=args.depth_filename_template,
-            depth_min=args.depth_min, depth_max=args.depth_max, compute_hypotheses=True,
-            patch_radius=args.patch_radius, gap_thresh=args.gap_thresh, ambiguity_thresh=0.0, min_valid=args.min_valid,
-        )
-    return None
-
-
-def mode_records(data: GtsfmData, provider, gt_dist, to_world) -> tuple[list[dict], set[int]]:
-    """Walk measurements once: per ambiguous measurement, did BA converge to the GT-closer depth mode?
-
-    Returns the per-measurement records and the set of tracks with >=1 ambiguous measurement.
-    """
-    records, ambiguous_tracks = [], set()
-    for j in range(data.number_tracks()):
-        track = data.get_track(j)
-        point_w = np.array(track.point3())
-        for m in range(track.numberMeasurements()):
-            i, uv = track.measurement(m)
-            cam = data.get_camera(i)
-            if cam is None:
-                continue
-            sample = provider.get_depth(i, float(uv[0]), float(uv[1]))
-            if sample is None or not sample.ambiguous or sample.depth_alt is None:
-                continue
-            ambiguous_tracks.add(j)
-            z = float(cam.pose().transformTo(point_w)[2])  # converged camera-frame Z
-            opt_mode = 2 if abs(z - sample.depth_alt) < abs(z - sample.depth) else 1
-            uv2 = gtsam.Point2(float(uv[0]), float(uv[1]))
-            dists = gt_dist(np.array([to_world(cam.backproject(uv2, sample.depth)),
-                                      to_world(cam.backproject(uv2, sample.depth_alt))]))
-            dist_d, dist_alt = float(dists[0]), float(dists[1])
-            records.append({
-                "gap": abs(sample.depth - sample.depth_alt),
-                "opt_mode": opt_mode,
-                "gt_mode": 1 if dist_d < dist_alt else 2,
-                "dist_best": min(dist_d, dist_alt),
-                "dist_selected": dist_d if opt_mode == 1 else dist_alt,  # GT distance of the chosen mode
-            })
-    return records, ambiguous_tracks
-
-
-def summarize_modes(records: list[dict], tau: float) -> dict:
-    """Aggregate mode-selection records into scalar metrics."""
-    n = len(records)
-    if n == 0:
-        return {"n_ambiguous_measurements": 0}
-    opt = np.array([r["opt_mode"] for r in records])
-    gt = np.array([r["gt_mode"] for r in records])
-    gap = np.array([r["gap"] for r in records])
-    best = np.array([r["dist_best"] for r in records])
-    selected = np.array([r["dist_selected"] for r in records])
-    correct = opt == gt
-    mode2 = opt == 2
-    return {
-        "n_ambiguous_measurements": n,
-        "mode2_selected_frac": float(mode2.mean()),
-        "mode_correct_frac": float(correct.mean()),                # BA picked the GT-closer hypothesis
-        "mode2_correct_frac": float(correct[mode2].mean()) if mode2.any() else 0.0,
-        "primary_correct_frac": float((gt == 1).mean()),           # always-pick-primary baseline
-        "bimodal_over_primary": float(correct.mean() - (gt == 1).mean()),
-        "oracle_within_tau_frac": float((best < tau).mean()),      # is a GT-accurate hypothesis even present
-        "selection_cost_mean_m": float((selected - best).mean()),  # GT-distance lost to wrong mode choices
-        "dist_selected_median_m": float(np.median(selected)),      # chosen surface's distance to GT
-        "gap_median": float(np.median(gap)),
-    }
-
-
-def subset_metrics(data: GtsfmData, track_ids: set[int], to_world, gt_points: np.ndarray, taus: list[float], gt_dist) -> dict:
-    """Global geometry metrics restricted to the ambiguous-track subset."""
-    if not track_ids:
-        return {"n_points": 0}
-    pts = np.array([to_world(data.get_track(j).point3()) for j in sorted(track_ids)])
-    return evaluate_points(pts, gt_points, taus, gt_dist)
+    to_world = lambda p: np.array(wSr.transformFrom(np.asarray(p, dtype=float)))
+    return to_world, {"sim3_scale": float(wSr.scale()), "camera_rms_m": float(rms_m)}
 
 
 def main() -> None:
@@ -253,35 +151,19 @@ def main() -> None:
     )
     parser.add_argument("--tau", type=float, nargs="+", default=[0.025, 0.05], help="Distance thresholds in meters.")
     parser.add_argument("--out", default=None, help="Output JSON path (default: <sfm_output>/../geometry_metrics.json).")
-    # Depth source (enables ambiguous-subset geometry + mode-correctness metrics). Pass at most one.
-    parser.add_argument("--depth_map_dir", default=None, help="On-disk depth maps (e.g. Replica GT).")
-    parser.add_argument("--depth_npz", default=None, help="A node's depth.npz (VGGT in-memory depth).")
-    parser.add_argument("--depth_scale", type=float, default=6553.5, help="Divisor for on-disk depth (1.0 for float).")
-    parser.add_argument("--depth_filename_template", default="depth{:06d}.png")
-    parser.add_argument("--depth_min", type=float, default=0.1)
-    parser.add_argument("--depth_max", type=float, default=20.0)
-    parser.add_argument("--gap_thresh", type=float, default=0.10)
-    parser.add_argument("--patch_radius", type=int, default=5)
-    parser.add_argument("--min_valid", type=int, default=10, help="Min valid patch pixels (match BA depth_min_valid).")
-    parser.add_argument("--mode_tau", type=float, default=0.05, help="Oracle band: a hypothesis this close to GT counts as available.")
     args = parser.parse_args()
 
     if args.align_mode != "none" and args.align_ref is None:
         parser.error(f"--align_mode {args.align_mode} requires --align_ref")
 
     wTi_list, img_fnames, _, points, _, _ = io_utils.read_scene_data_from_colmap_format(args.sfm_output)
-    to_world = build_to_world(args.align_mode, args.align_ref, wTi_list, img_fnames)
+    to_world, alignment = build_to_world(args.align_mode, args.align_ref, wTi_list, img_fnames)
     points = np.array([to_world(p) for p in points])
 
     gt_points, gt_dist = build_gt(args.gt_ply)  # point-to-surface accuracy for a mesh PLY
     metrics = evaluate_points(points, gt_points, args.tau, gt_dist)
-
-    if args.depth_map_dir or args.depth_npz:
-        data = GtsfmData.read_colmap(args.sfm_output)
-        provider = build_provider(args, data)
-        records, ambiguous_tracks = mode_records(data, provider, gt_dist, to_world)
-        metrics["modes"] = summarize_modes(records, args.mode_tau)
-        metrics["ambiguous_subset"] = subset_metrics(data, ambiguous_tracks, to_world, gt_points, args.tau, gt_dist)
+    if alignment is not None:
+        metrics["alignment"] = alignment  # sim3_scale + camera-center RMS (m) for the sweep table
 
     out_path = Path(args.out) if args.out else Path(args.sfm_output).parent / "geometry_metrics.json"
     out_path.write_text(json.dumps(metrics, indent=2))

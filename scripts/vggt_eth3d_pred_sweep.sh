@@ -105,24 +105,16 @@ uv run python -m gtsfm.runner \
     $DEPTH_ARGS
 
 # Pick the reconstruction to evaluate: merged scene if the scene partitioned
-# (>1 cluster), otherwise the single-cluster vggt output. depth.npz (and thus the
-# mode/ambiguous metrics) is only well-defined for the single-cluster case.
+# (>1 cluster), otherwise the single-cluster vggt output.
 if [ -d "$OUT/results/merged" ]; then
     SFM="$OUT/results/merged"
-    DEPTH=""
-    echo "Multi-cluster scene: evaluating merged/ (mode metrics need per-node eval; skipped here)."
 else
     SFM="$OUT/results/vggt"
-    DEPTH=""
-    if [ "$MODE" != "none" ] && [ -f "$OUT/results/depth.npz" ]; then
-        DEPTH="--depth_npz $OUT/results/depth.npz --gap_thresh $GAPTHRESH"
-    fi
 fi
 
 echo "=== [2/3] Geometry eval vs GT scan ($SFM) ==="
 uv run python gtsfm/evaluation/eval_geometry.py \
     --sfm_output $SFM \
-    $DEPTH \
     --align_mode eth3d \
     --align_ref $DATA/$SEQ/dslr_calibration_undistorted \
     --gt_ply $GT \
@@ -145,8 +137,8 @@ if [ "${KEEP_GS_ARTIFACTS:-0}" != "1" ]; then
 fi
 # Debug image dumps (not used downstream).
 rm -rf "$OUT/results/processed_images"
-# results/depth.npz (~18MB) is kept by default: it lets you re-run eval_geometry at other
-# gap_thresh values without re-running VGGT. Set DROP_DEPTH_NPZ=1 to remove it.
+# results/depth.npz (~18MB) is the raw VGGT per-node depth; kept by default for inspection/reuse.
+# Set DROP_DEPTH_NPZ=1 to remove it.
 [ "${DROP_DEPTH_NPZ:-0}" = "1" ] && rm -f "$OUT/results/depth.npz"
 
 echo "Done. Results in $OUT"

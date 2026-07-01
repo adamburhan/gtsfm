@@ -5,38 +5,31 @@
 #SBATCH --gres=gpu:a100l:1
 #SBATCH --time=06:00:00
 
-# Classical (unified) GTSfM on ETH3D with Depth Pro metric depth factors.
-#   1) GTSfM: SuperPoint+LightGlue front end, COLMAP loader, depth-aware cluster BA.
-#   2) Geometry eval vs GT laser scan.
-#
-# Depth maps are Depth Pro per-image metric depth (.npy, meters), named <image_stem>.npy. They MUST
-# be at the loader's working resolution (short side <= max_resolution); the depth factor is brought
-# into the gauge-arbitrary classical-SfM scale at BA time via depth_auto_scale (robust global scale).
-#
-# Usage: cluv submit mila scripts/unified_eth3d_depthpro_sweep.sh -- <sequence> <mode> [gap_thresh]
-#   e.g. cluv submit mila scripts/unified_eth3d_depthpro_sweep.sh -- kicker bimodal_gmm
-#   mode: none | bimodal_gap | bimodal_gmm | bimodal_gmm_null
 
 set -eo pipefail
 module load cuda/12.6.0
 
-SEQ=${1:?usage: unified_eth3d_depthpro_sweep.sh <sequence> <mode> [gap_thresh]}
+SEQ=${1:?usage: unified_eth3d_depthpro_sweep.sh <seq> <mode> <gap> <sweep_name> <depth_subdir> <gt_scale> <gt_gate> <auto_scale>}
 MODE=${2:?mode: none | unimodal | bimodal_gap | bimodal_gmm | bimodal_gmm_null}
 GAPTHRESH=${3:-0.10}
-MAX_RES=${MAX_RES:-760}          # loader short-side cap; depth .npy must match this resolution
-NULL_NSIGMA=${NULL_NSIGMA:-5}    # bimodal_gmm_null: opt out when best mode > N sigmas off
-GT_POSES=${GT_POSES:-false}      # false = real from-scratch SfM (gauge-free); true = GT-anchored metric poses
-AUTO_SCALE=${AUTO_SCALE:-true}   # reconcile metric depth with recon scale; needed iff GT_POSES=false
-GT_GATE=${GT_GATE:-true}        # oracle diagnostic: drop depth factors whose modes all miss the GT surface
-GT_TAU=${GT_TAU:-0.1}           # gate band (m): a mode this close to GT counts as valid
-GT_ORACLE=${GT_ORACLE:-false}    # also collapse to the GT-closest mode (mode-selection ceiling)
-PATCH_RADIUS=${PATCH_RADIUS:-3}  # half-size of the patch for gap/GMM ambiguity analysis
+# Args 4-8 are the knobs that vary across the table. cluv submit does not forward env vars to the
+# job, so they are passed positionally. The rest are fixed defaults below.
+SWEEP_NAME=${4:-eth3d_unified_depthpro_g${GAPTHRESH}}
+DEPTH_SUBDIR=${5:-depth_pro_760}   # depth_pro_760 | gt_depth_mesh_760 (GT-depth-as-source oracle)
+GT_SCALE=${6:-false}               # fix sf to the GT Sim(3) scale (removes the auto_scale confound)
+GT_GATE=${7:-false}                # oracle diagnostic: drop factors whose modes all miss the GT surface
+AUTO_SCALE=${8:-true}              # point-ratio metric<->recon scale; used iff GT_SCALE/GT_GATE off
+MAX_RES=760                        # loader short-side cap; depth .npy must match this resolution
+NULL_NSIGMA=5                      # bimodal_gmm_null: opt out when best mode > N sigmas off
+GT_POSES=false                     # false = real from-scratch SfM (gauge-free); true = GT-anchored poses
+GT_TAU=0.1                         # gate band (m): a mode this close to GT counts as valid
+GT_ORACLE=false                    # also collapse to the GT-closest mode (mode-selection ceiling)
+PATCH_RADIUS=3                     # half-size of the patch for gap/GMM ambiguity analysis
 
 project_name="gtsfm"
 project_root="$HOME/repos/$project_name"
 DATA="$SCRATCH/datasets/eth3d"
-SWEEP=${SWEEP_NAME:-eth3d_unified_depthpro_g${GAPTHRESH}}
-OUT="$SCRATCH/logs/sweeps/${SWEEP}/${SEQ}/${MODE}"
+OUT="$SCRATCH/logs/sweeps/${SWEEP_NAME}/${SEQ}/${MODE}"
 GT="$DATA/$SEQ/${SEQ}_gt.ply"
 GT_MESH="$DATA/$SEQ/occlusion/surface_mesh.ply"   # ETH3D occlusion surface mesh (true point-to-surface gating)
 COLMAP_DIR="$DATA/$SEQ/dslr_calibration_undistorted"
@@ -81,7 +74,7 @@ DEPTH_COMMON="$BA.depth_map_dir=$DEPTH_DIR \
     $BA.depth_min=0.1 $BA.depth_max=100.0 $BA.depth_gap_thresh=$GAPTHRESH \
     $BA.depth_patch_radius=$PATCH_RADIUS \
     $BA.depth_gt_gate=$GT_GATE $BA.depth_gt_ply=$GT_MESH $BA.depth_gt_align_ref=$COLMAP_DIR \
-    $BA.depth_gt_tau=$GT_TAU $BA.depth_gt_oracle_select=$GT_ORACLE"
+    $BA.depth_gt_tau=$GT_TAU $BA.depth_gt_oracle_select=$GT_ORACLE $BA.depth_gt_scale=$GT_SCALE"
 
 DEPTH_ARGS=""
 case "$MODE" in
@@ -94,9 +87,10 @@ case "$MODE" in
     *) echo "unknown mode: $MODE" >&2; exit 1 ;;
 esac
 
-echo "=== [1/2] GTSfM (unified/classical): seq=$SEQ mode=$MODE gap=$GAPTHRESH max_res=$MAX_RES gt_poses=$GT_POSES auto_scale=$AUTO_SCALE gt_gate=$GT_GATE oracle=$GT_ORACLE ==="
+echo "=== [1/2] GTSfM (unified/classical): seq=$SEQ mode=$MODE gap=$GAPTHRESH max_res=$MAX_RES gt_poses=$GT_POSES auto_scale=$AUTO_SCALE gt_gate=$GT_GATE oracle=$GT_ORACLE gt_scale=$GT_SCALE ==="
 uv run python -m gtsfm.runner \
     --config_name unified.yaml \
+    --correspondence_generator_config_name sift \
     --loader colmap \
     --dataset_dir $COLMAP_DIR \
     --images_dir $IMAGES_DIR \
