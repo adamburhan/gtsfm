@@ -13,7 +13,7 @@ set -e
 GAP=0.10
 S=scripts/unified_eth3d_depthpro_sweep.sh
 TABLE=eth3d_table        # shared parent root for all conditions (aggregate over this)
-SEQUENCES="kicker"
+SEQUENCES="kicker courtyard delivery_area electro facade meadow office terrace pipes playground relief relief_2 terrains"
 DEPTHPRO=depth_pro_760
 GT=gt_depth_mesh_760
 
