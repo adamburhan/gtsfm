@@ -107,7 +107,11 @@ def collect(run_dir: Path) -> dict:
 
 
 def discover(root: Path) -> dict:
-    """Find {(seq, mode): run_dir} by locating mode-named dirs that contain a run."""
+    """Find {(source, seq, mode): run_dir} by locating mode-named dirs that contain a run.
+
+    source = the top-level condition dir (the sweep_name, e.g. gt / depthpro), seq = the dir just
+    above the mode. source is "" for a flat <seq>/<mode> root (single-condition aggregation).
+    """
     runs = {}
     for mode in MODE_ORDER:
         for d in root.rglob(mode):
@@ -115,7 +119,8 @@ def discover(root: Path) -> dict:
                 continue
             parents = d.relative_to(root).parts[:-1]
             seq = next((p for p in reversed(parents) if p != "modes"), "scene")
-            runs[(seq, mode)] = d
+            source = parents[0] if len(parents) >= 2 else ""
+            runs[(source, seq, mode)] = d
     return runs
 
 
@@ -144,25 +149,24 @@ def latex_table(df: pd.DataFrame, caption: str, label: str) -> str:
         r" & & \multicolumn{3}{c}{Geometry (mm) $\downarrow$} & \multicolumn{3}{c}{NVS} "
         r"& \multicolumn{3}{c}{Pose AUC $\uparrow$} \\",
         r"\cmidrule(lr){3-5}\cmidrule(lr){6-8}\cmidrule(lr){9-11}",
-        "Seq. & Mode & " + " & ".join(h for _, h, _, _, _ in PAPER_COLS) + r" \\", r"\midrule",
+        "Seq. & Method & " + " & ".join(h for _, h, _, _, _ in PAPER_COLS) + r" \\", r"\midrule",
     ]
     for si, seq in enumerate(seqs):
         if si:
             rows.append(r"\midrule")
-        sub = df[df["seq"] == seq]
-        modes = [m for m in MODE_ORDER if m in set(sub["mode"])]
+        sub = df[df["seq"] == seq].sort_values(["source", "mode"])
         best = {k: _best_value(sub[k], scale, prec, direction)
                 for k, _, scale, prec, direction in PAPER_COLS if k in sub.columns}
-        for mi, mode in enumerate(modes):
-            r = sub[sub["mode"] == mode].iloc[0]
+        for ri, (_, r) in enumerate(sub.iterrows()):
             cells = []
             for k, _, scale, prec, _ in PAPER_COLS:
                 s = _fmt(r.get(k), scale, prec)
                 if s != "---" and best.get(k) is not None and round(r[k] * scale, prec) == best[k]:
                     s = r"\best{%s}" % s
                 cells.append(s)
-            first = r"\multirow{%d}{*}{%s}" % (len(modes), _tex(seq)) if mi == 0 else ""
-            rows.append(f"{first} & {_tex(mode)} & " + " & ".join(cells) + r" \\")
+            method = f"{r['source']}/{r['mode']}" if r["source"] else str(r["mode"])
+            first = r"\multirow{%d}{*}{%s}" % (len(sub), _tex(seq)) if ri == 0 else ""
+            rows.append(f"{first} & {_tex(method)} & " + " & ".join(cells) + r" \\")
     rows += [r"\bottomrule", r"\end{tabular}", f"\\caption{{{caption}}}", f"\\label{{{label}}}", r"\end{table*}"]
     return "\n".join(rows)
 
@@ -192,20 +196,21 @@ def main() -> None:
             mode, _, path = spec.partition("=")
             if not path:
                 raise SystemExit(f"Expected mode=run_dir, got '{spec}'")
-            run_map[("scene", mode)] = Path(path)
+            run_map[("", "scene", mode)] = Path(path)
     if not run_map:
         raise SystemExit("No runs found.")
 
-    recs = [{"seq": seq, "mode": mode, **collect(d)} for (seq, mode), d in run_map.items()]
+    recs = [{"source": src, "seq": seq, "mode": mode, **collect(d)} for (src, seq, mode), d in run_map.items()]
     df = pd.DataFrame(recs)
     df["mode"] = pd.Categorical(df["mode"], [m for m in MODE_ORDER if m in set(df["mode"])])
-    df = df.sort_values(["seq", "mode"]).reset_index(drop=True)
+    df["source"] = pd.Categorical(df["source"], sorted(set(df["source"])))
+    df = df.sort_values(["seq", "source", "mode"]).reset_index(drop=True)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_dir / "all_metrics.csv", index=False)
 
-    disp = pd.DataFrame({"seq": df["seq"], "mode": df["mode"]})
+    disp = pd.DataFrame({"seq": df["seq"], "source": df["source"], "mode": df["mode"]})
     for key, header, scale, prec in DIAG_COLS:
         disp[header] = df[key].map(lambda v: _fmt(v, scale, prec)) if key in df.columns else "---"
     print("\n== Diagnostic table (geometry cm | pose RMS cm | Sim(3) scale) ==")
