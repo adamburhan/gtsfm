@@ -39,6 +39,7 @@ NVS_KEYS = ["psnr", "ssim", "lpips", "num_GS"]
 # Diagnostic per-scene table (printed + reference). (json_key, header, scale, precision).
 DIAG_COLS = [
     ("n_points", "n", 1, 0),
+    ("n_factors", "n_fac", 1, 0),
     ("accuracy_median_m", "median_cm", 100, 2),
     ("accuracy_mean_m", "mean_cm", 100, 2),
     ("accuracy_p95_m", "p95_cm", 100, 2),
@@ -99,6 +100,14 @@ def collect(run_dir: Path) -> dict:
             rec["rot_err_median_deg"] = _median(ba.get("rotation_angle_error_deg"))
             rec["trans_err_median"] = _median(ba.get("translation_error_distance"))
             break
+    # Depth factors actually applied (unimodal + bimodal), from the BA metrics. n_factors=0 on a
+    # depth row means the map was missing / all samples skipped -> the run is silently just `none`.
+    bam = _find(run_dir, "bundle_adjustment_metrics.json")
+    if bam:
+        ba = json.loads(bam.read_text()).get("bundle_adjustment_metrics", {})
+        uni, bim = ba.get("num_depth_factors_unimodal"), ba.get("num_depth_factors_bimodal")
+        if uni is not None or bim is not None:
+            rec["n_factors"] = int(uni or 0) + int(bim or 0)
     vals = sorted(run_dir.rglob("val_step*.json"), key=lambda p: int(re.search(r"(\d+)", p.stem).group(1)))
     if vals:
         gs = json.loads(vals[-1].read_text())
