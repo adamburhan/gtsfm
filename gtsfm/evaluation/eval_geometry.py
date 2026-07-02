@@ -2,7 +2,8 @@
 
 Geometry (Tanks & Temples protocol): accuracy/precision@tau, completeness/recall@tau, F-score@tau,
 and point-to-GT-surface distance percentiles (true point-to-surface distance for a mesh GT).
-(Camera-pose metrics come from bundle_adjustment_metrics.json; NVS / 3DGS metrics are evaluated
+Also computes camera-pose metrics (relative pose AUC + absolute rotation/translation error) from the
+saved cameras vs the GT reference, written into the same JSON. (NVS / 3DGS metrics are evaluated
 separately.)
 
 Authors: Adam Burhan
@@ -20,7 +21,8 @@ import trimesh.sample
 from scipy.spatial import cKDTree
 
 import gtsfm.utils.io as io_utils
-from gtsfm.utils import align
+from gtsfm.utils import align, transform
+from gtsfm.utils import metrics as metrics_utils
 
 N_GT_SAMPLES = 1_000_000
 
@@ -59,6 +61,35 @@ def sim3_align(wTi_list, gt_poses: dict[int, gtsam.Pose3]) -> tuple[gtsam.Simila
     wSr = align.sim3_from_Pose3_maps_robust(aTi, bTi)
     residuals = [np.linalg.norm(wSr.transformFrom(bTi[i].translation()) - aTi[i].translation()) for i in aTi]
     return wSr, float(np.sqrt(np.mean(np.square(residuals))))
+
+
+def compute_pose_metrics(wTi_list, img_fnames, align_mode: str, align_ref) -> dict | None:
+    """Relative pose AUC + absolute rot/trans errors vs GT, computed from the saved cameras.
+
+    Recovers the pose metrics that BA's own `evaluate()` skipped (it early-returns when image_info is
+    empty). Uses only the estimated poses in the reconstruction plus the GT reference, so it can be run
+    offline over existing `ba_output` dirs with no re-reconstruction. Emits the same keys and JSON shape
+    as `bundle_adjustment_metrics.json` (pose_auc_@X_deg scalars; rotation_angle_error_deg /
+    translation_error_distance as {"summary": {...}} distributions), so the sweep aggregator reads them
+    identically. Returns None when GT poses are unavailable (align_mode "none"/"tnt") or too few match.
+    """
+    if align_mode not in ("replica", "eth3d"):
+        return None
+    load_poses = _gt_poses_from_traj if align_mode == "replica" else _gt_poses_from_colmap
+    gt_poses = load_poses(align_ref, img_fnames)
+    matched = {i: wTi_list[i] for i in gt_poses if i < len(wTi_list) and wTi_list[i] is not None}
+    if len(matched) < 3:
+        return None
+    # Align estimated cameras into the GT frame (AUC uses gauge-free relative errors; the absolute
+    # rot/trans metrics need this Sim(3)).
+    wSr, _ = sim3_align(wTi_list, gt_poses)
+    aligned = transform.Pose3_map_with_sim3(wSr, matched)
+    group = metrics_utils.compute_ba_pose_metrics(
+        gt_wTi={i: gt_poses[i] for i in matched},
+        computed_wTi=aligned,
+        metric_constructed_only=True,
+    )
+    return next(iter(group.get_metrics_as_dict().values()))
 
 
 def load_gt_points(gt_ply: str) -> np.ndarray:
@@ -164,6 +195,10 @@ def main() -> None:
     metrics = evaluate_points(points, gt_points, args.tau, gt_dist)
     if alignment is not None:
         metrics["alignment"] = alignment  # sim3_scale + camera-center RMS (m) for the sweep table
+
+    pose_metrics = compute_pose_metrics(wTi_list, img_fnames, args.align_mode, args.align_ref)
+    if pose_metrics is not None:
+        metrics.update(pose_metrics)  # pose AUC + rot/trans errors (recovered offline; see aggregate_modes)
 
     out_path = Path(args.out) if args.out else Path(args.sfm_output).parent / "geometry_metrics.json"
     out_path.write_text(json.dumps(metrics, indent=2))

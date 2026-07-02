@@ -100,6 +100,12 @@ def collect(run_dir: Path) -> dict:
             rec["rot_err_median_deg"] = _median(ba.get("rotation_angle_error_deg"))
             rec["trans_err_median"] = _median(ba.get("translation_error_distance"))
             break
+    # Fallback: pose metrics computed offline into geometry_metrics.json (eval_geometry.py). Classical
+    # runs never wrote a native pose section, so recover AUC/rot/trans from the geometry JSON here.
+    if g and rec.get("pose_auc_@1.0_deg") is None:
+        rec.update({k: geom.get(k) for k in POSE_KEYS})
+        rec["rot_err_median_deg"] = _median(geom.get("rotation_angle_error_deg"))
+        rec["trans_err_median"] = _median(geom.get("translation_error_distance"))
     # Depth factors actually applied (unimodal + bimodal), from the BA metrics. n_factors=0 on a
     # depth row means the map was missing / all samples skipped -> the run is silently just `none`.
     bam = _find(run_dir, "bundle_adjustment_metrics.json")
