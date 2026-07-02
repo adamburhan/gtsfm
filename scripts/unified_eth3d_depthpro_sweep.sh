@@ -20,7 +20,6 @@ DEPTH_SUBDIR=${5:-depth_pro_760}   # depth_pro_760 | gt_depth_mesh_760 (GT-depth
 GT_SCALE=${6:-false}               # fix sf to the GT Sim(3) scale (removes the auto_scale confound)
 GT_GATE=${7:-false}                # oracle diagnostic: drop factors whose modes all miss the GT surface
 AUTO_SCALE=${8:-true}              # point-ratio metric<->recon scale; used iff GT_SCALE/GT_GATE off
-NUM_VIEWS=${9:-}                   # sparse-view sweep: keep only this many views (nested subset); empty = all
 MAX_RES=760                        # loader short-side cap; depth .npy must match this resolution
 NULL_NSIGMA=5                      # bimodal_gmm_null: opt out when best mode > N sigmas off
 GT_POSES=false                     # false = real from-scratch SfM (gauge-free); true = GT-anchored poses
@@ -90,11 +89,7 @@ case "$MODE" in
     *) echo "unknown mode: $MODE" >&2; exit 1 ;;
 esac
 
-# Sparse-view sweep: only pass loader.num_views when a count is given (empty = full sequence).
-NVIEWS_ARG=""
-[ -n "$NUM_VIEWS" ] && NVIEWS_ARG="loader.num_views=$NUM_VIEWS"
-
-echo "=== [1/3] GTSfM (unified/classical): seq=$SEQ mode=$MODE gap=$GAPTHRESH max_res=$MAX_RES gt_poses=$GT_POSES auto_scale=$AUTO_SCALE gt_gate=$GT_GATE oracle=$GT_ORACLE gt_scale=$GT_SCALE num_views=${NUM_VIEWS:-all} ==="
+echo "=== [1/3] GTSfM (unified/classical): seq=$SEQ mode=$MODE gap=$GAPTHRESH max_res=$MAX_RES gt_poses=$GT_POSES auto_scale=$AUTO_SCALE gt_gate=$GT_GATE oracle=$GT_ORACLE gt_scale=$GT_SCALE ==="
 uv run python -m gtsfm.runner \
     --config_name unified.yaml \
     --correspondence_generator_config_name sift \
@@ -105,7 +100,6 @@ uv run python -m gtsfm.runner \
     --output_root $OUT \
     --dask_tmpdir $SLURM_TMPDIR \
     loader.use_gt_extrinsics=$GT_POSES \
-    $NVIEWS_ARG \
     $DEPTH_ARGS
 
 # The single-cluster classical reconstruction is written under results/. Prefer the merged scene if

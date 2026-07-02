@@ -17,24 +17,6 @@ from gtsfm.loader.loader_base import LoaderBase
 logger = logger_utils.get_logger()
 
 
-def _nested_spread_order(n: int) -> List[int]:
-    """Farthest-point ordering of indices [0..n-1] in capture order.
-
-    Every prefix is well-spread AND nested (the first k indices are a subset of the first k+1), so
-    taking the first ``k`` yields nested, evenly-spread view subsets for any k — used for the
-    sparse-view sweep so smaller view counts are subsets of larger ones. Start from the two
-    endpoints, then repeatedly add the index sitting in the biggest remaining gap (farthest from its
-    nearest already-picked view); ties break to the smallest index for determinism.
-    """
-    if n <= 1:
-        return list(range(n))
-    order = [0, n - 1]
-    while len(order) < n:
-        cand = max((i for i in range(n) if i not in order), key=lambda i: min(abs(i - j) for j in order))
-        order.append(cand)
-    return order
-
-
 class ColmapLoader(LoaderBase):
     """Simple loader class that reads a dataset with ground-truth files and dataset meta-information
     formatted in the COLMAP style. This meta-information may include image file names stored
@@ -66,7 +48,6 @@ class ColmapLoader(LoaderBase):
         max_resolution: int = 760,
         default_focal_length_factor: Optional[float] = None,
         input_worker: Optional[str] = None,
-        num_views: Optional[int] = None,
     ) -> None:
         """Initializes to load from a specified dataset directory on disk.
 
@@ -88,8 +69,6 @@ class ColmapLoader(LoaderBase):
             default_focal_length_factor: When set, focal length is initialized to
                default_focal_length_factor * max(width, height) if COLMAP reports a zero
                focal length. When None (default), zero focal lengths are passed through as-is.
-            num_views: When set, keep only this many views, selected as a nested, evenly-spread
-               subset (see `_nested_spread_order`). Used for the sparse-view sweep; None keeps all.
         """
         super().__init__(max_resolution, input_worker)
         self._dataset_dir = dataset_dir
@@ -134,17 +113,6 @@ class ColmapLoader(LoaderBase):
             self._wTi_list.append(wTi)
             if calibrations is not None:
                 self._calibrations.append(calibrations[i])
-
-        if num_views is not None and num_views < len(self._image_paths):
-            # Nested, evenly-spread subset: smaller counts are subsets of larger ones. Select on the
-            # farthest-point order, then re-sort to capture order so the pipeline sees monotone indices.
-            keep = sorted(_nested_spread_order(len(self._image_paths))[:num_views])
-            self._img_fnames = [self._img_fnames[i] for i in keep]
-            self._image_paths = [self._image_paths[i] for i in keep]
-            self._wTi_list = [self._wTi_list[i] for i in keep]
-            if self._calibrations:
-                self._calibrations = [self._calibrations[i] for i in keep]
-            logger.info("ColmapLoader: nested-subsampled to %d views (requested %d).", len(keep), num_views)
 
         self._num_imgs = len(self._image_paths)
         logger.info("Colmap image loader found and loaded %d images", self._num_imgs)
