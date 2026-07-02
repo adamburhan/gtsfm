@@ -7,3 +7,4 @@ use_gt_extrinsics: true # Whether to use ground truth extrinsics from COLMAP
 max_resolution: 760
 default_focal_length_factor: null # set to e.g. 1.2 to substitute default_focal_length_factor * max(w,h) when COLMAP reports zero focal length
 input_worker: null # optional input worker specification
+num_views: null # sparse-view sweep: keep only this many views (nested, evenly-spread subset); null = all
