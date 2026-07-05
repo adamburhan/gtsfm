@@ -101,6 +101,9 @@ def collect(run_dir: Path) -> dict:
         alignment = geom.get("alignment", {})
         rec["sim3_scale"] = alignment.get("sim3_scale")
         rec["camera_rms_m"] = alignment.get("camera_rms_m")
+        rot = geom.get("rotation_angle_error_deg")
+        if isinstance(rot, dict):
+            rec["n_cams_eval"] = rot.get("summary", {}).get("len")
     for fname, wrapper in POSE_FILES:
         b = _find(run_dir, fname)
         if b:
@@ -180,16 +183,20 @@ def latex_table(df: pd.DataFrame, caption: str, label: str) -> str:
         if si:
             rows.append(r"\midrule")
         sub = df[df["seq"] == seq].sort_values(["source", "mode"])
-        best = {k: _best_value(sub[k], scale, prec, direction)
-                for k, _, scale, prec, direction in PAPER_COLS if k in sub.columns}
+        healthy = sub[~sub["degenerate"]]
+        best = {k: _best_value(healthy[k], scale, prec, direction)
+                for k, _, scale, prec, direction in PAPER_COLS if k in healthy.columns}
         for ri, (_, r) in enumerate(sub.iterrows()):
             cells = []
             for k, _, scale, prec, _ in PAPER_COLS:
                 s = _fmt(r.get(k), scale, prec)
-                if s != "---" and best.get(k) is not None and round(r[k] * scale, prec) == best[k]:
+                if (s != "---" and not r["degenerate"] and best.get(k) is not None
+                        and round(r[k] * scale, prec) == best[k]):
                     s = r"\best{%s}" % s
                 cells.append(s)
             method = f"{r['source']}/{r['mode']}" if r["source"] else str(r["mode"])
+            if r["degenerate"]:
+                method += r"$^\dagger$"
             first = r"\multirow{%d}{*}{%s}" % (len(sub), _tex(seq)) if ri == 0 else ""
             rows.append(f"{first} & {_tex(method)} & " + " & ".join(cells) + r" \\")
     rows += [r"\bottomrule", r"\end{tabular}", f"\\caption{{{caption}}}", f"\\label{{{label}}}", r"\end{table*}"]
@@ -227,6 +234,11 @@ def main() -> None:
 
     recs = [{"source": src, "seq": seq, "mode": mode, **collect(d)} for (src, seq, mode), d in run_map.items()]
     df = pd.DataFrame(recs)
+    # Degenerate-run guard: an insane eval alignment (camera RMS > 1 m — healthy runs sit < 0.5 m)
+    # means the Sim(3) itself failed; the row's geometry numbers are garbage (e.g. mean_m in the
+    # hundreds with a sane-looking median). Flag instead of tabulating: excluded from LaTeX
+    # best-bolding and dagger-marked everywhere.
+    df["degenerate"] = df.get("camera_rms_m", pd.Series(dtype=float)).fillna(0.0) > 1.0
     df["mode"] = pd.Categorical(df["mode"], [m for m in MODE_ORDER if m in set(df["mode"])])
     df["source"] = pd.Categorical(df["source"], sorted(set(df["source"])))
     df = df.sort_values(["seq", "source", "mode"]).reset_index(drop=True)
@@ -235,7 +247,10 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_dir / "all_metrics.csv", index=False)
 
-    disp = pd.DataFrame({"seq": df["seq"], "source": df["source"], "mode": df["mode"]})
+    disp = pd.DataFrame({
+        "seq": df["seq"], "source": df["source"],
+        "mode": [f"{m} †DEGEN" if d else str(m) for m, d in zip(df["mode"], df["degenerate"])],
+    })
     for key, header, scale, prec in DIAG_COLS:
         disp[header] = df[key].map(lambda v: _fmt(v, scale, prec)) if key in df.columns else "---"
     print("\n== Diagnostic table (geometry cm | pose RMS cm | Sim(3) scale) ==")
