@@ -32,7 +32,7 @@ MODE_ORDER = [
     # relative sigma (_rs) and relative sigma + per-image profiled scale (_rs_pis) conditions
     "unimodal_rs", "unimodal_rs_pis", "bimodal_gmm_rs", "bimodal_gmm_rs_pis",
     # rs_pis ablations: Huber on depth factors; 10 alternation rounds (convergence check)
-    "unimodal_rs_pis_huber", "unimodal_rs_pis_r10",
+    "unimodal_rs_pis_huber", "unimodal_rs_pis_r10", "bimodal_gmm_rs_pis_huber",
 ]
 # Per-image profiled scale summaries (present only on _pis runs), carried into the main table.
 PIS_KEYS = ["pis_n_rounds", "pis_a_mean", "pis_a_std", "pis_a_min", "pis_a_max", "pis_n_fallback", "pis_n_clamped"]
