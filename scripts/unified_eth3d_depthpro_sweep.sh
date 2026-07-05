@@ -11,7 +11,7 @@ module load cuda/12.6.0
 export PYTHONHASHSEED=0   # deterministic set/dict-hash ordering (must be set before python starts)
 
 SEQ=${1:?usage: unified_eth3d_depthpro_sweep.sh <seq> <mode> <gap> <sweep_name> <depth_subdir> <gt_scale> <gt_gate> <auto_scale>}
-MODE=${2:?mode: none | unimodal | bimodal_gap | bimodal_gmm | bimodal_gmm_null}
+MODE=${2:?mode: none | unimodal | bimodal_gap | bimodal_gmm | bimodal_gmm_null | unimodal_rs | unimodal_rs_pis | bimodal_gmm_rs | bimodal_gmm_rs_pis}
 GAPTHRESH=${3:-0.10}
 # Args 4-8 are the knobs that vary across the table. cluv submit does not forward env vars to the
 # job, so they are passed positionally. The rest are fixed defaults below.
@@ -22,6 +22,8 @@ GT_GATE=${7:-false}                # oracle diagnostic: drop factors whose modes
 AUTO_SCALE=${8:-true}              # point-ratio metric<->recon scale; used iff GT_SCALE/GT_GATE off
 MAX_RES=760                        # loader short-side cap; depth .npy must match this resolution
 NULL_NSIGMA=5                      # bimodal_gmm_null: opt out when best mode > N sigmas off
+REL_SIGMA=0.05                     # _rs modes: per-factor sigma = max(REL_SIGMA * a_i * d, SIGMA_FLOOR) meters
+SIGMA_FLOOR=0.02                   # _rs modes: lower bound (m) on the relative sigma
 GT_POSES=false                     # false = real from-scratch SfM (gauge-free); true = GT-anchored poses
 GT_TAU=0.1                         # gate band (m): a mode this close to GT counts as valid
 GT_ORACLE=false                    # also collapse to the GT-closest mode (mode-selection ceiling)
@@ -78,12 +80,21 @@ DEPTH_COMMON="$BA.depth_map_dir=$DEPTH_DIR \
     $BA.depth_gt_gate=$GT_GATE $BA.depth_gt_ply=$GT_MESH $BA.depth_gt_align_ref=$COLMAP_DIR \
     $BA.depth_gt_tau=$GT_TAU $BA.depth_gt_oracle_select=$GT_ORACLE $BA.depth_gt_scale=$GT_SCALE"
 
+# _rs = depth-proportional sigma; _pis = per-image profiled scale (outer alternation).
+RS_ARGS="$BA.depth_relative_sigma=$REL_SIGMA $BA.depth_sigma_floor=$SIGMA_FLOOR"
+PIS_ARGS="$BA.depth_per_image_scale=true"
+
 DEPTH_ARGS=""
 case "$MODE" in
     none) DEPTH_ARGS="$BA.depth_model=none" ;;
     unimodal) DEPTH_ARGS="$BA.depth_model=unimodal $DEPTH_COMMON" ;;  # single depth factor, no patch/GMM (use for clean GT-depth oracle)
+    unimodal_rs) DEPTH_ARGS="$BA.depth_model=unimodal $RS_ARGS $DEPTH_COMMON" ;;
+    unimodal_rs_pis) DEPTH_ARGS="$BA.depth_model=unimodal $RS_ARGS $PIS_ARGS $DEPTH_COMMON" ;;
     bimodal_gap) DEPTH_ARGS="$BA.depth_model=bimodal $BA.depth_hypothesis_method=gap $DEPTH_COMMON" ;;
     bimodal_gmm) DEPTH_ARGS="$BA.depth_model=bimodal $BA.depth_hypothesis_method=gmm $DEPTH_COMMON" ;;
+    bimodal_gmm_rs) DEPTH_ARGS="$BA.depth_model=bimodal $BA.depth_hypothesis_method=gmm $RS_ARGS $DEPTH_COMMON" ;;
+    bimodal_gmm_rs_pis) DEPTH_ARGS="$BA.depth_model=bimodal $BA.depth_hypothesis_method=gmm \
+        $RS_ARGS $PIS_ARGS $DEPTH_COMMON" ;;
     bimodal_gmm_null) DEPTH_ARGS="$BA.depth_model=bimodal $BA.depth_hypothesis_method=gmm \
         $BA.depth_null_nsigma=$NULL_NSIGMA $DEPTH_COMMON" ;;
     *) echo "unknown mode: $MODE" >&2; exit 1 ;;

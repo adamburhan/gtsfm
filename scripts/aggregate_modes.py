@@ -26,7 +26,14 @@ from pathlib import Path
 
 import pandas as pd
 
-MODE_ORDER = ["none", "unimodal", "drop_ambiguous", "bimodal", "bimodal_gap", "bimodal_gmm", "bimodal_gmm_null", "bimodal_mda", "bimodal_mda_null"]
+MODE_ORDER = [
+    "none", "unimodal", "drop_ambiguous", "bimodal", "bimodal_gap", "bimodal_gmm", "bimodal_gmm_null",
+    "bimodal_mda", "bimodal_mda_null",
+    # relative sigma (_rs) and relative sigma + per-image profiled scale (_rs_pis) conditions
+    "unimodal_rs", "unimodal_rs_pis", "bimodal_gmm_rs", "bimodal_gmm_rs_pis",
+]
+# Per-image profiled scale summaries (present only on _pis runs), carried into the main table.
+PIS_KEYS = ["pis_n_rounds", "pis_a_mean", "pis_a_std", "pis_a_min", "pis_a_max", "pis_n_fallback", "pis_n_clamped"]
 POSE_KEYS = ["pose_auc_@1.0_deg", "pose_auc_@2.5_deg", "pose_auc_@5.0_deg"]
 # Pose metrics live in different files per pipeline; prefer the merged/final one.
 POSE_FILES = [
@@ -114,6 +121,7 @@ def collect(run_dir: Path) -> dict:
         uni, bim = ba.get("num_depth_factors_unimodal"), ba.get("num_depth_factors_bimodal")
         if uni is not None or bim is not None:
             rec["n_factors"] = int(uni or 0) + int(bim or 0)
+        rec.update({k: ba[k] for k in PIS_KEYS if k in ba})
     vals = sorted(run_dir.rglob("val_step*.json"), key=lambda p: int(re.search(r"(\d+)", p.stem).group(1)))
     if vals:
         gs = json.loads(vals[-1].read_text())

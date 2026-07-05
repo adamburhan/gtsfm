@@ -3,12 +3,13 @@
 Authors: Xiaolong Wu, John Lambert, Ayush Baid
 """
 
+import json
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import dask
 import gtsam  # type: ignore
@@ -189,6 +190,125 @@ def make_mixture_depth_factor(
     return gtsam.CustomFactor(noise, [pose_key, lm_key], error_func)
 
 
+class DepthFactorRecord(NamedTuple):
+    """One depth-factor measurement, kept so the per-image scale refit can rebuild factors.
+
+    All quantities are post-``sf`` (recon units): ``depths`` are the mode means fed to the factor
+    before any per-image scale ``a_i`` is applied. ``sigmas``/``log_weights`` are set for mixture
+    records only (the unimodal/bimodal kinds take their noise model from the BA options).
+    """
+
+    i: int  # camera index (X key)
+    j: int  # track index (P key)
+    kind: str  # "unimodal" | "bimodal" | "mixture"
+    depths: Tuple[float, ...]
+    sigmas: Optional[Tuple[float, ...]] = None
+    log_weights: Optional[Tuple[float, ...]] = None
+
+
+def refit_depth_scales(
+    records: List[DepthFactorRecord],
+    values: Values,
+    a_prev: Dict[int, float],
+    *,
+    min_factors: int,
+    clamp: float,
+    null_nsigma: Optional[float] = None,
+    resid_scale: float = 1.0,
+) -> Tuple[Dict[int, float], Dict[int, dict]]:
+    """Per-image profiled depth scale: ``log a_i = median_k(log z_k - log m_k)`` (sigma_a -> inf).
+
+    For each record, ``z_k`` is the camera-frame Z of the current point under the current pose (from
+    ``values``); ``m_k`` is the record's measurement for the currently winning mode. Mixture records
+    select the mode with the factor's own rule (``0.5 r^2 + log sigma`` on the a_prev-scaled modes;
+    the common ``log a_prev`` term makes this equal to selecting against ``a_prev * mu``) and are
+    excluded when routed to the null hypothesis; behind-camera factors (z <= 0) are excluded too.
+    Images with fewer than ``min_factors`` usable factors fall back to a_i = 1.0 (global sf only).
+
+    Deterministic: records are consumed in build order and images emitted in sorted order; no RNG.
+
+    Args:
+        records: Depth factor records in graph build order.
+        values: Current estimate (poses X(i) and points P(j)).
+        a_prev: Previous per-image scales (missing image -> 1.0).
+        min_factors: Below this many usable factors, a_i = 1.0 and fallback is flagged.
+        clamp: Hard bound on |log a_i|.
+        null_nsigma: Mixture null-hypothesis band (None = off), matching the factor's.
+        resid_scale: Multiplier mapping recon-unit residuals to meters (the ``sf`` of this stage),
+            applied only to the logged median residuals.
+
+    Returns:
+        (a_new, info): new per-image scales, and per-image log entries
+        {image_id, n_factors_used, log_a, a, fallback, clamped, median_abs_resid_pre/post}.
+    """
+    zm: Dict[int, List[Tuple[float, float]]] = defaultdict(list)
+    image_ids = sorted({rec.i for rec in records})
+    n_behind = 0
+    n_null = 0
+    for rec in records:
+        pose_wTc = values.atPose3(X(rec.i))
+        point_w = values.atPoint3(P(rec.j))
+        z = float(pose_wTc.transformTo(point_w)[2])
+        if z <= 0.0:
+            n_behind += 1
+            continue
+        a = float(a_prev.get(rec.i, 1.0))
+        if rec.kind == "mixture":
+            mus = np.asarray(rec.depths, dtype=np.float64)
+            sigs = np.asarray(rec.sigmas, dtype=np.float64)
+            r = (z - a * mus) / (a * sigs)
+            k = int(np.argmin(0.5 * r * r + np.log(a * sigs)))
+            if null_nsigma is not None and abs(r[k]) > null_nsigma:
+                n_null += 1
+                continue
+            m = float(mus[k])
+        elif rec.kind == "bimodal":
+            m = float(min(rec.depths, key=lambda d: abs(z - a * d)))
+        else:
+            m = float(rec.depths[0])
+        if m <= 0.0:
+            continue
+        zm[rec.i].append((z, m))
+    if n_behind or n_null:
+        logger.info(
+            "Depth scale refit: excluded %d behind-camera and %d null-routed factors.", n_behind, n_null
+        )
+
+    a_new: Dict[int, float] = {}
+    info: Dict[int, dict] = {}
+    for i in image_ids:
+        pairs = zm.get(i, [])
+        n = len(pairs)
+        fallback = n < min_factors
+        clamped = False
+        if fallback:
+            log_a = 0.0
+        else:
+            log_a = float(np.median([np.log(z) - np.log(m) for z, m in pairs]))
+            if abs(log_a) > clamp:
+                clamped = True
+                log_a = float(np.clip(log_a, -clamp, clamp))
+                logger.warning("Depth scale refit: image %d hit the |log a| <= %.3f clamp.", i, clamp)
+        a_i = float(np.exp(log_a))
+        a_pre = float(a_prev.get(i, 1.0))
+        a_new[i] = a_i
+        info[i] = {
+            "image_id": i,
+            "n_factors_used": n,
+            "log_a": log_a,
+            "a": a_i,
+            "fallback": fallback,
+            "clamped": clamped,
+            "median_abs_resid_pre": float(np.median([abs(z - a_pre * m) for z, m in pairs]) * resid_scale)
+            if pairs
+            else None,
+            "median_abs_resid_post": float(np.median([abs(z - a_i * m) for z, m in pairs]) * resid_scale)
+            if pairs
+            else None,
+        }
+    return a_new, info
+
+
 def multi_view_retriangulate_from_2d_tracks(
     gtsfm_data: GtsfmData,
     tracks_2d: List["SfmTrack2d"],
@@ -333,6 +453,17 @@ class BundleAdjustmentOptions:
     depth_gt_tau: float = 0.05
     depth_gt_oracle_select: bool = False  # also collapse to the GT-closest mode (mode-selection ceiling)
     depth_gt_scale: bool = False  # use the GT Sim(3) scale for sf even when gating is off (removes the auto_scale confound)
+    # Relative (depth-proportional) sigma for unimodal/bimodal depth factors: sigma = max(rel * a_i * d, floor).
+    # 0.0 keeps the legacy fixed depth_factor_sigma. Both sigmas are metric (meters), whitened by /sf as before.
+    depth_relative_sigma: float = 0.0
+    depth_sigma_floor: float = 0.02
+    # Per-image profiled depth scale a_i (sigma_a -> inf limit of a scale-nuisance model), fit by
+    # outer alternation (BA -> refit -> rebuild). sf handles the global gauge; a_i the per-image differential.
+    depth_per_image_scale: bool = False
+    depth_pis_min_factors: int = 20  # images with fewer usable factors keep a_i = 1.0 (global sf only)
+    depth_pis_max_rounds: int = 4  # max (BA -> refit) alternation rounds per BA stage
+    depth_pis_tol: float = 1e-3  # stop when max_i |delta log a_i| < tol
+    depth_pis_clamp: float = 0.693  # hard clamp |log a_i| <= clamp (log 2)
 
     def to_optimizer(self, **overrides) -> "BundleAdjustmentOptimizer":
         """Construct a :class:`BundleAdjustmentOptimizer` from these options.
@@ -386,6 +517,13 @@ class BundleAdjustmentOptions:
             depth_gt_tau=self.depth_gt_tau,
             depth_gt_oracle_select=self.depth_gt_oracle_select,
             depth_gt_scale=self.depth_gt_scale,
+            depth_relative_sigma=self.depth_relative_sigma,
+            depth_sigma_floor=self.depth_sigma_floor,
+            depth_per_image_scale=self.depth_per_image_scale,
+            depth_pis_min_factors=self.depth_pis_min_factors,
+            depth_pis_max_rounds=self.depth_pis_max_rounds,
+            depth_pis_tol=self.depth_pis_tol,
+            depth_pis_clamp=self.depth_pis_clamp,
         )
         kwargs.update(overrides)
         return BundleAdjustmentOptimizer(**kwargs)
@@ -465,6 +603,13 @@ class BundleAdjustmentOptimizer:
         depth_gt_tau: float = 0.05,
         depth_gt_oracle_select: bool = False,
         depth_gt_scale: bool = False,
+        depth_relative_sigma: float = 0.0,
+        depth_sigma_floor: float = 0.02,
+        depth_per_image_scale: bool = False,
+        depth_pis_min_factors: int = 20,
+        depth_pis_max_rounds: int = 4,
+        depth_pis_tol: float = 1e-3,
+        depth_pis_clamp: float = 0.693,
         # ── Optional post-BA multi-view retriangulation (opt-in) ──
         # When `use_multi_view_retriangulation=True`: after the existing BA loop
         # converges, re-triangulate the union-find 2D tracks against the post-BA
@@ -571,6 +716,24 @@ class BundleAdjustmentOptimizer:
         self._depth_gt_tau = depth_gt_tau
         self._depth_gt_oracle_select = depth_gt_oracle_select
         self._depth_gt_scale = depth_gt_scale
+        self._depth_relative_sigma = depth_relative_sigma
+        self._depth_sigma_floor = depth_sigma_floor
+        self._depth_per_image_scale = depth_per_image_scale
+        self._depth_pis_min_factors = depth_pis_min_factors
+        self._depth_pis_max_rounds = depth_pis_max_rounds
+        self._depth_pis_tol = depth_pis_tol
+        self._depth_pis_clamp = depth_pis_clamp
+        if self._depth_per_image_scale and use_gnc:
+            # GNC weight filtering renumbers tracks between rounds, invalidating the cached records.
+            raise ValueError("depth_per_image_scale is not supported with use_gnc.")
+        # Per-image profiled scale state (reset per BA invocation in _run_ba_and_evaluate).
+        self._pis_a: Dict[int, float] = {}
+        self._pis_records: Optional[List[DepthFactorRecord]] = None
+        self._pis_sf: float = 1.0
+        self._pis_round_active = False  # alternation rebuild: reuse cached records, don't resample
+        self._pis_log: List[dict] = []
+        self._pis_round_counter = 0
+        self._pis_last_info: Dict[int, dict] = {}
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
@@ -850,8 +1013,10 @@ class BundleAdjustmentOptimizer:
         k = int(np.argmin(dists))
         return float(dists[k]) < self._depth_gt_tau, valid[k]
 
-    def __depth_factors(self, initial_data: GtsfmData, cameras_to_model: List[int]) -> NonlinearFactorGraph:
-        """Generate camera-frame-Z depth factors for track measurements.
+    def __prepare_depth_records(
+        self, initial_data: GtsfmData, cameras_to_model: List[int]
+    ) -> Tuple[List[DepthFactorRecord], float]:
+        """Sample depth, apply the GT gate, and compute ``sf`` — the once-per-stage measurement prep.
 
         Mirrors `__reprojection_factors`' track/measurement gating so the depth
         factors live on exactly the same observation edges. A measurement with no
@@ -859,11 +1024,15 @@ class BundleAdjustmentOptimizer:
         measurements (near depth discontinuities) are handled per `depth_model`:
         dropped in DROP_AMBIGUOUS mode, given a max-mixture factor in BIMODAL
         mode, and treated as unimodal otherwise.
+
+        Returns records (post-sf measurements, in graph build order) and ``sf``, so
+        `__build_depth_graph` can rebuild the factors for any per-image scale
+        assignment without resampling. The gate runs on the unscaled (post-sf)
+        measurements, so a_i never affects gate decisions.
         """
-        graph = NonlinearFactorGraph()
         depth_provider = self.__get_depth_provider()
         if depth_provider is None:
-            return graph
+            return [], 1.0
 
         # GT null-hypothesis gate (oracle diagnostic): drop factors whose modes all miss the GT surface.
         gate = self.__build_gt_gate(initial_data, cameras_to_model)
@@ -871,15 +1040,7 @@ class BundleAdjustmentOptimizer:
         # Scale mapping metric depth into the gauge-arbitrary recon frame (a separate concern from the gate).
         sf = self.__depth_scale(initial_data, cameras_to_model, depth_provider, gate)
 
-        # Noise models. depth_factor_sigma is a METRIC (meters) sigma; the residual is in recon units
-        # (z_pred - d/sf), so whiten by sigma/sf — matching the mixture path, which divides its per-mode
-        # sigmas by sf. unit_noise is scale-free: the mixture factor whitens by its own per-mode sigma.
-        depth_noise = Isotropic.Sigma(1, self._depth_factor_sigma / sf)
-        unit_noise = Isotropic.Sigma(1, 1.0)
-        if self._depth_factor_robust_loss:
-            depth_noise = Robust(mEstimator.Huber(self._robust_noise_basin), depth_noise)
-            unit_noise = Robust(mEstimator.Huber(self._robust_noise_basin), unit_noise)
-
+        records: List[DepthFactorRecord] = []
         n_unimodal = 0
         n_bimodal = 0
         n_dropped_ambiguous = 0
@@ -909,21 +1070,19 @@ class BundleAdjustmentOptimizer:
                         continue
                     if self._depth_gt_oracle_select and best_mode is not None:
                         # Mode-selection ceiling: collapse to the GT-closest hypothesis (unimodal).
-                        graph.push_back(make_depth_factor(X(i), P(j), best_mode / sf, depth_noise))
+                        records.append(DepthFactorRecord(i, j, "unimodal", (best_mode / sf,)))
                         n_unimodal += 1
                         continue
                 if sample.is_mixture:
                     # Weighted max-mixture factor (no gating). The provider returns final per-mode
                     # sigmas in depth units (MDA bakes in its sigma_rel; GMM uses its fitted sigmas),
                     # so they are passed through directly here.
-                    graph.push_back(
-                        make_mixture_depth_factor(
-                            X(i), P(j),
-                            [d / sf for d in sample.depths],
-                            [s_ / sf for s_ in sample.sigmas],
-                            list(sample.log_weights),
-                            unit_noise,
-                            null_nsigma=self._depth_null_nsigma,
+                    records.append(
+                        DepthFactorRecord(
+                            i, j, "mixture",
+                            tuple(d / sf for d in sample.depths),
+                            tuple(s_ / sf for s_ in sample.sigmas),
+                            tuple(sample.log_weights),
                         )
                     )
                     n_bimodal += 1
@@ -933,12 +1092,10 @@ class BundleAdjustmentOptimizer:
                     continue
                 if sample.ambiguous and self._depth_model == DepthFactorMode.BIMODAL:
                     assert sample.depth_alt is not None
-                    graph.push_back(
-                        make_bimodal_depth_factor(X(i), P(j), sample.depth / sf, sample.depth_alt / sf, depth_noise)
-                    )
+                    records.append(DepthFactorRecord(i, j, "bimodal", (sample.depth / sf, sample.depth_alt / sf)))
                     n_bimodal += 1
                 else:
-                    graph.push_back(make_depth_factor(X(i), P(j), sample.depth / sf, depth_noise))
+                    records.append(DepthFactorRecord(i, j, "unimodal", (sample.depth / sf,)))
                     n_unimodal += 1
 
         logger.info(
@@ -957,7 +1114,164 @@ class BundleAdjustmentOptimizer:
             "skipped": n_skipped,
             "gt_gated": n_gt_gated,
         }
+        return records, sf
+
+    def __build_depth_graph(
+        self, records: List[DepthFactorRecord], sf: float, a: Optional[Dict[int, float]] = None
+    ) -> NonlinearFactorGraph:
+        """Depth factor graph from prepared records, optionally with per-image scales ``a``.
+
+        a_i enters as a scaled measurement: unimodal/bimodal measurements become a_i * d, and every
+        mixture mode mean AND its (mu-proportional) sigma scale by a_i — no new factor type. With
+        ``a=None`` (or all-ones) and ``depth_relative_sigma=0`` this reproduces the legacy graph
+        bit-identically (same floats, same push order, same shared noise objects).
+        """
+        graph = NonlinearFactorGraph()
+        if not records:
+            return graph
+
+        # Noise models. depth_factor_sigma is a METRIC (meters) sigma; the residual is in recon units
+        # (z_pred - d/sf), so whiten by sigma/sf — matching the mixture path, which divides its per-mode
+        # sigmas by sf. unit_noise is scale-free: the mixture factor whitens by its own per-mode sigma.
+        depth_noise = Isotropic.Sigma(1, self._depth_factor_sigma / sf)
+        unit_noise = Isotropic.Sigma(1, 1.0)
+        if self._depth_factor_robust_loss:
+            depth_noise = Robust(mEstimator.Huber(self._robust_noise_basin), depth_noise)
+            unit_noise = Robust(mEstimator.Huber(self._robust_noise_basin), unit_noise)
+
+        def unimodal_noise(d_scaled: float):
+            # Depth-proportional sigma on the (scaled) measured depth — fixed within a round. Both
+            # rel*a*d and the floor are metric, whitened by /sf like depth_factor_sigma (d_scaled is
+            # already post-sf, so rel * d_scaled == rel * d_metric / sf).
+            if self._depth_relative_sigma <= 0.0:
+                return depth_noise
+            noise = Isotropic.Sigma(1, max(self._depth_relative_sigma * d_scaled, self._depth_sigma_floor / sf))
+            if self._depth_factor_robust_loss:
+                noise = Robust(mEstimator.Huber(self._robust_noise_basin), noise)
+            return noise
+
+        for rec in records:
+            a_i = 1.0 if a is None else float(a.get(rec.i, 1.0))
+            if rec.kind == "mixture":
+                depths = list(rec.depths) if a_i == 1.0 else [a_i * d for d in rec.depths]
+                sigmas = list(rec.sigmas) if a_i == 1.0 else [a_i * s_ for s_ in rec.sigmas]
+                graph.push_back(
+                    make_mixture_depth_factor(
+                        X(rec.i), P(rec.j),
+                        depths,
+                        sigmas,
+                        list(rec.log_weights),
+                        unit_noise,
+                        null_nsigma=self._depth_null_nsigma,
+                    )
+                )
+            elif rec.kind == "bimodal":
+                d, d_alt = a_i * rec.depths[0], a_i * rec.depths[1]
+                graph.push_back(make_bimodal_depth_factor(X(rec.i), P(rec.j), d, d_alt, unimodal_noise(d)))
+            else:
+                d = a_i * rec.depths[0]
+                graph.push_back(make_depth_factor(X(rec.i), P(rec.j), d, unimodal_noise(d)))
         return graph
+
+    def __depth_factors(self, initial_data: GtsfmData, cameras_to_model: List[int]) -> NonlinearFactorGraph:
+        """Generate camera-frame-Z depth factors (see `__prepare_depth_records` / `__build_depth_graph`).
+
+        With `depth_per_image_scale` on, the first build of a stage also runs the round-0 scale refit
+        against the initial structure (before any optimization); alternation rebuilds (flagged via
+        `_pis_round_active`) reuse the stage's cached records so the gate/sf are computed once.
+        """
+        if self._pis_round_active and self._pis_records is not None:
+            records, sf = self._pis_records, self._pis_sf
+        else:
+            records, sf = self.__prepare_depth_records(initial_data, cameras_to_model)
+            self._pis_records, self._pis_sf = records, sf
+            if self._depth_per_image_scale and records:
+                a0, info = refit_depth_scales(
+                    records,
+                    initial_data.to_values(shared_calib=self._shared_calib),
+                    self._pis_a,
+                    min_factors=self._depth_pis_min_factors,
+                    clamp=self._depth_pis_clamp,
+                    null_nsigma=self._depth_null_nsigma,
+                    resid_scale=sf,
+                )
+                self._pis_a = a0
+                self.__log_pis_round(info)
+        a = self._pis_a if (self._depth_per_image_scale and records) else None
+        return self.__build_depth_graph(records, sf, a)
+
+    def __log_pis_round(self, info: Dict[int, dict], cost_pre_refit: Optional[float] = None) -> None:
+        """Append one refit round to the per-image scale log (every round is a deliverable)."""
+        self._pis_last_info = info
+        self._pis_log.append(
+            {
+                "round": self._pis_round_counter,
+                "cost_pre_refit": cost_pre_refit,  # graph error of the solution this refit was computed from
+                "images": [info[i] for i in sorted(info)],
+            }
+        )
+        self._pis_round_counter += 1
+
+    def __pis_alternation(
+        self,
+        initial_data: GtsfmData,
+        optimized_data: GtsfmData,
+        result_values: Values,
+        final_error: float,
+        gnc_valid_mask: List[bool],
+        cameras_to_model: List[int],
+        absolute_pose_priors: List[Optional[PosePrior]],
+        relative_pose_priors: Dict[Tuple[int, int], PosePrior],
+        ordering_type: str,
+    ) -> Tuple[GtsfmData, Values, float, List[bool]]:
+        """Outer alternation for the per-image profiled depth scale (the sigma_a -> inf limit).
+
+        Round 0 (the fit against the initial structure) ran at graph construction, so the caller's
+        first optimize is round 1. Each round refits a from the current estimate, rebuilds the graph
+        with the cached records (no resampling; gate/sf unchanged), and re-optimizes warm-started
+        from the last solution — so the returned values are always consistent with the final a,
+        including on the tol-exit (the spec's final consistency optimize is structural here).
+        """
+        if not (self._depth_per_image_scale and self._pis_records):
+            return optimized_data, result_values, final_error, gnc_valid_mask
+
+        delta = float("inf")
+        converged = False
+        for _ in range(self._depth_pis_max_rounds):
+            a_prev = self._pis_a
+            a_new, info = refit_depth_scales(
+                self._pis_records,
+                result_values,
+                a_prev,
+                min_factors=self._depth_pis_min_factors,
+                clamp=self._depth_pis_clamp,
+                null_nsigma=self._depth_null_nsigma,
+                resid_scale=self._pis_sf,
+            )
+            delta = max((abs(np.log(a_new[i]) - np.log(a_prev.get(i, 1.0))) for i in a_new), default=0.0)
+            self._pis_a = a_new
+            self.__log_pis_round(info, cost_pre_refit=final_error)
+            converged = delta < self._depth_pis_tol
+
+            self._pis_round_active = True
+            try:
+                graph = self.__construct_factor_graph(
+                    cameras_to_model, initial_data, absolute_pose_priors, relative_pose_priors
+                )
+            finally:
+                self._pis_round_active = False
+            optimized_data, result_values, final_error, gnc_valid_mask = self.__optimize_and_recover(
+                optimized_data, graph, ordering_type
+            )
+            if converged:
+                break
+        if not converged:
+            logger.warning(
+                "Per-image depth scale: hit max_rounds=%d without convergence (max |dlog a| = %.4g).",
+                self._depth_pis_max_rounds,
+                delta,
+            )
+        return optimized_data, result_values, final_error, gnc_valid_mask
 
     def _between_factors(
         self, relative_pose_priors: Dict[Tuple[int, int], PosePrior], cameras_to_model: List[int]
@@ -1376,9 +1690,15 @@ class BundleAdjustmentOptimizer:
         graph = self.__construct_factor_graph(
             cameras_to_model, initial_data, absolute_pose_priors, relative_pose_priors
         )
+        ordering_type = self._ordering_type if not cameras_with_insufficient_tracks else "COLAMD"
         optimized_data, result_values, final_error, gnc_valid_mask = self.__optimize_and_recover(
-            initial_data, graph, self._ordering_type if not cameras_with_insufficient_tracks else "COLAMD"
+            initial_data, graph, ordering_type
         )
+        if self._depth_per_image_scale:
+            optimized_data, result_values, final_error, gnc_valid_mask = self.__pis_alternation(
+                initial_data, optimized_data, result_values, final_error, gnc_valid_mask,
+                cameras_to_model, absolute_pose_priors, relative_pose_priors, ordering_type,
+            )
         if not running_two_view_ba:
             # Add the non-BA cameras from initial_data back.
             for camera_idx in cameras_with_insufficient_tracks:
@@ -1533,6 +1853,12 @@ class BundleAdjustmentOptimizer:
                 `depth_model != "none"` — used to locate per-image depth maps.
         """
         self._image_fnames = image_fnames
+        # Fresh per-image-scale state per BA invocation.
+        self._pis_a = {}
+        self._pis_records = None
+        self._pis_log = []
+        self._pis_round_counter = 0
+        self._pis_last_info = {}
         logger.info(
             "Input: %d tracks on %d cameras", initial_data.number_tracks(), len(initial_data.get_valid_camera_indices())
         )
@@ -1618,6 +1944,18 @@ class BundleAdjustmentOptimizer:
         self.__stamp_image_fnames(optimized_data)
         self.__stamp_image_fnames(filtered_result)
 
+        # Per-image profiled scale log: every refit round for every image (the a-trajectory is a
+        # deliverable — it gets overlaid against the offline bias_fit.csv per-image scales).
+        if self._depth_per_image_scale and self._pis_log and save_dir is not None:
+            fnames = self._image_fnames or {}
+            for round_entry in self._pis_log:
+                for img_entry in round_entry["images"]:
+                    img_entry.setdefault("image_fname", fnames.get(img_entry["image_id"]))
+            log_path = Path(save_dir) / "depth_per_image_scale_log.json"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(json.dumps({"sf": self._pis_sf, "rounds": self._pis_log}, indent=1))
+            logger.info("Wrote per-image depth scale log to %s.", log_path)
+
         metrics = self.evaluate(optimized_data, filtered_result, cameras_gt, save_dir)  # type: ignore
         for i, step_time in enumerate(step_times):
             metrics.add_metric(GtsfmMetric(f"step_{i}_run_duration_sec", step_time))
@@ -1645,6 +1983,20 @@ class BundleAdjustmentOptimizer:
         ba_metrics = GtsfmMetricsGroup(name=METRICS_GROUP, metrics=unfiltered_data.get_metrics(suffix="_unfiltered"))
         for stat_name, stat_value in self._depth_factor_stats.items():
             ba_metrics.add_metric(GtsfmMetric(name=f"num_depth_factors_{stat_name}", data=stat_value))
+        if self._depth_per_image_scale and self._pis_last_info:
+            # Scalar summaries of the final per-image scales (the aggregator carries these columns).
+            entries = list(self._pis_last_info.values())
+            a_vals = np.array([e["a"] for e in entries])
+            for name, value in [
+                ("pis_n_rounds", self._pis_round_counter),
+                ("pis_a_mean", float(a_vals.mean())),
+                ("pis_a_std", float(a_vals.std())),
+                ("pis_a_min", float(a_vals.min())),
+                ("pis_a_max", float(a_vals.max())),
+                ("pis_n_fallback", sum(e["fallback"] for e in entries)),
+                ("pis_n_clamped", sum(e["clamped"] for e in entries)),
+            ]:
+                ba_metrics.add_metric(GtsfmMetric(name=name, data=value))
 
         input_image_idxs = list(unfiltered_data._image_info.keys())
         poses_gt = {

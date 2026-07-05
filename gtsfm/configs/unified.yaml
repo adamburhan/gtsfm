@@ -134,6 +134,13 @@ cluster_optimizer:
       depth_gt_tau: 0.05              # gate band: a mode this close to GT (m) counts as valid
       depth_gt_oracle_select: false   # also collapse to the GT-closest mode (mode-selection ceiling)
       depth_gt_scale: false           # fix sf to the GT Sim(3) scale even when gating is off (removes the auto_scale confound)
+      depth_relative_sigma: 0.0       # >0: per-factor sigma = max(rel * a_i * d, depth_sigma_floor) meters; 0 = fixed depth_factor_sigma
+      depth_sigma_floor: 0.02         # lower bound (m) on the relative per-factor sigma
+      depth_per_image_scale: false    # per-image profiled depth scale a_i via outer (BA -> refit) alternation
+      depth_pis_min_factors: 20       # images with fewer usable depth factors keep a_i = 1.0 (global sf only)
+      depth_pis_max_rounds: 4         # max alternation rounds per BA stage
+      depth_pis_tol: 0.001            # stop when max_i |delta log a_i| < tol
+      depth_pis_clamp: 0.693          # hard clamp |log a_i| <= clamp (log 2)
 
   # comment out to not run
   dense_multiview_optimizer:
