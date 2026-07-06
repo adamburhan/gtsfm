@@ -128,6 +128,8 @@ cluster_optimizer:
       depth_gmm_sigma_floor: 0.05     # gmm: relative floor on per-mode sigma (frac of mode depth)
       depth_null_nsigma: null         # mixture null hypothesis: opt out if best mode > N sigmas off (null=off)
       depth_auto_scale: false         # divide metric depth by a robust global recon<-metric scale (classical SfM)
+      depth_log_alpha: false          # log-depth residuals with a free per-image scale offset alpha_i (structure-only)
+      depth_alpha_sigma: 1.0          # prior sigma on alpha_i about the shared init scale (null = free)
       depth_gt_gate: false            # GT null-hypothesis gate: drop factor unless a mode is within tau of GT (oracle diagnostic)
       depth_gt_ply: null              # GT cloud (.ply) for the gate
       depth_gt_align_ref: null        # COLMAP GT-pose dir for the gate (eval_geometry --align_ref)
