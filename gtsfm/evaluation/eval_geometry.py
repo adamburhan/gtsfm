@@ -107,9 +107,11 @@ def load_gt_points(gt_ply: str) -> np.ndarray:
 def build_gt(gt_ply: str):
     """Returns (gt_points, gt_dist): GT surface points for completeness, and a recon->GT distance fn.
 
-    For a mesh PLY, gt_dist is true point-to-SURFACE distance (open3d raycasting), and gt_points are
-    uniformly sampled from the surface. For a point-cloud PLY it falls back to nearest-point (which
-    overestimates near the surface). Prefer a mesh (e.g. ETH3D occlusion/surface_mesh.ply).
+    For a point-cloud PLY (e.g. the merged ETH3D scan), gt_dist is nearest-point (point-to-point);
+    scan sampling density sets the distance floor, so sub-voxel taus are not meaningful. For a mesh
+    PLY, gt_dist is true point-to-SURFACE distance (open3d raycasting), and gt_points are uniformly
+    sampled from the surface — but a reconstructed mesh's interpolated surface biases accuracy, so
+    the raw scan is preferred as GT.
     """
     import open3d as o3d
 
@@ -121,7 +123,7 @@ def build_gt(gt_ply: str):
         return gt_points, lambda p: scene.compute_distance(o3d.core.Tensor(np.asarray(p, np.float32))).numpy()
     gt_points = load_gt_points(gt_ply)
     tree = cKDTree(gt_points)
-    return gt_points, lambda p: tree.query(np.asarray(p))[0]
+    return gt_points, lambda p: tree.query(np.asarray(p), workers=-1)[0]
 
 
 def evaluate_points(points: np.ndarray, gt_points: np.ndarray, taus: list[float], gt_dist=None) -> dict:
@@ -130,8 +132,8 @@ def evaluate_points(points: np.ndarray, gt_points: np.ndarray, taus: list[float]
     `gt_dist` (recon-point -> GT distance) defaults to nearest-point over `gt_points`; pass a
     point-to-surface fn (see `build_gt` on a mesh) for the fairer accuracy metric.
     """
-    d_acc = gt_dist(points) if gt_dist is not None else cKDTree(gt_points).query(points, k=1)[0]  # recon -> GT
-    d_comp = cKDTree(points).query(gt_points, k=1)[0]  # GT -> recon
+    d_acc = gt_dist(points) if gt_dist is not None else cKDTree(gt_points).query(points, k=1, workers=-1)[0]
+    d_comp = cKDTree(points).query(gt_points, k=1, workers=-1)[0]  # GT -> recon
 
     metrics: dict = {
         "n_points": int(points.shape[0]),

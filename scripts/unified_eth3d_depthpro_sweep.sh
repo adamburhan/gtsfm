@@ -120,11 +120,13 @@ else
 fi
 
 echo "=== [2/3] Geometry eval vs GT scan ($SFM) ==="
+# GT scan point cloud (point-to-point), not the occlusion mesh (point-to-surface): the mesh is a
+# reconstruction itself and its interpolated surface biases the accuracy numbers.
 uv run python gtsfm/evaluation/eval_geometry.py \
     --sfm_output $SFM \
     --align_mode eth3d \
     --align_ref $COLMAP_DIR \
-    --gt_ply $GT_MESH \
+    --gt_ply "$GT" \
     --tau 0.01 0.02 0.05 0.1 0.2 0.5 \
     --out $OUT/geometry_metrics.json
 
