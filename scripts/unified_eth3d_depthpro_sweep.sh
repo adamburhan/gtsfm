@@ -11,7 +11,7 @@ module load cuda/12.6.0
 export PYTHONHASHSEED=0   # deterministic set/dict-hash ordering (must be set before python starts)
 
 SEQ=${1:?usage: unified_eth3d_depthpro_sweep.sh <seq> <mode> <gap> <sweep_name> <depth_subdir> <gt_scale> <gt_gate> <auto_scale>}
-MODE=${2:?mode: none | unimodal | bimodal_gap | bimodal_gmm | bimodal_gmm_null}
+MODE=${2:?mode: none | unimodal | bimodal_gap | bimodal_gmm | bimodal_gmm_null | unimodal_log | bimodal_log}
 GAPTHRESH=${3:-0.10}
 # Args 4-8 are the knobs that vary across the table. cluv submit does not forward env vars to the
 # job, so they are passed positionally. The rest are fixed defaults below.
@@ -26,6 +26,7 @@ GT_POSES=false                     # false = real from-scratch SfM (gauge-free);
 GT_TAU=0.1                         # gate band (m): a mode this close to GT counts as valid
 GT_ORACLE=false                    # also collapse to the GT-closest mode (mode-selection ceiling)
 PATCH_RADIUS=3                     # half-size of the patch for gap/GMM ambiguity analysis
+ALPHA_SIGMA=1.0                    # *_log modes: prior sigma on alpha_i about the shared init scale
 GS_STEPS=7000                      # Gaussian-splatting training steps for the NVS eval
 
 project_name="gtsfm"
@@ -72,6 +73,7 @@ BA="cluster_optimizer.multiview_optimizer.bundle_adjustment_module"
 # depth_scale=1 (float meters); depth_auto_scale reconciles metric depth with the classical-SfM scale.
 DEPTH_COMMON="$BA.depth_map_dir=$DEPTH_DIR \
     $BA.depth_filename_template=null $BA.depth_ext=.npy \
+    $BA.depth_factor_robust_loss=true \
     $BA.depth_scale=1.0 $BA.depth_auto_scale=$AUTO_SCALE \
     $BA.depth_min=0.1 $BA.depth_max=100.0 $BA.depth_gap_thresh=$GAPTHRESH \
     $BA.depth_patch_radius=$PATCH_RADIUS \
@@ -86,6 +88,13 @@ case "$MODE" in
     bimodal_gmm) DEPTH_ARGS="$BA.depth_model=bimodal $BA.depth_hypothesis_method=gmm $DEPTH_COMMON" ;;
     bimodal_gmm_null) DEPTH_ARGS="$BA.depth_model=bimodal $BA.depth_hypothesis_method=gmm \
         $BA.depth_null_nsigma=$NULL_NSIGMA $DEPTH_COMMON" ;;
+    # *_log: log-depth residuals with a free per-image scale offset alpha_i (structure-only depth).
+    # Same metric depth_factor_sigma, converted per-measurement to relative (sigma/d). alpha init
+    # subsumes auto_scale, so AUTO_SCALE only shifts the alphas (harmless).
+    unimodal_log) DEPTH_ARGS="$BA.depth_model=unimodal $BA.depth_log_alpha=true \
+        $BA.depth_alpha_sigma=$ALPHA_SIGMA $DEPTH_COMMON" ;;
+    bimodal_log) DEPTH_ARGS="$BA.depth_model=bimodal $BA.depth_hypothesis_method=gmm $BA.depth_log_alpha=true \
+        $BA.depth_alpha_sigma=$ALPHA_SIGMA $DEPTH_COMMON" ;;
     *) echo "unknown mode: $MODE" >&2; exit 1 ;;
 esac
 
