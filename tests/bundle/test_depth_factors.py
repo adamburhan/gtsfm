@@ -14,9 +14,9 @@ from pathlib import Path
 import gtsam  # type: ignore
 import numpy as np
 from gtsam import Point3, Pose3, Rot3, Values
-from gtsam.symbol_shorthand import P, X  # type: ignore
+from gtsam.symbol_shorthand import A, P, X  # type: ignore
 
-from gtsfm.bundle.bundle_adjustment import make_bimodal_depth_factor, make_depth_factor
+from gtsfm.bundle.bundle_adjustment import make_bimodal_depth_factor, make_depth_factor, make_log_depth_factor
 from gtsfm.common.depth_provider import DepthProvider
 
 DEPTH_NOISE = gtsam.noiseModel.Isotropic.Sigma(1, 0.1)
@@ -99,6 +99,94 @@ class TestDepthFactors(unittest.TestCase):
             r_plus = residual(self.wTc, self.point_w + delta)
             r_minus = residual(self.wTc, self.point_w - delta)
             self.assertAlmostEqual(H_point[0, k], (r_plus - r_minus) / (2 * eps), places=5)
+
+
+UNIT_NOISE = gtsam.noiseModel.Isotropic.Sigma(1, 1.0)
+
+
+class TestLogDepthFactor(unittest.TestCase):
+    """Unit tests for the log-space depth factor with a per-image alpha offset."""
+
+    def setUp(self):
+        super().setUp()
+        self.wTc = Pose3(Rot3.RzRyRx(0.1, -0.2, 0.3), np.array([0.5, -1.0, 2.0]))
+        self.point_c = np.array([0.4, -0.2, 3.0])
+        self.point_w = self.wTc.transformFrom(Point3(self.point_c))
+        self.alpha = 0.2
+        self.values = self._make_values(self.wTc, self.point_w, self.alpha)
+
+    @staticmethod
+    def _make_values(wTc: Pose3, point_w: np.ndarray, alpha: float) -> Values:
+        values = Values()
+        values.insert(X(0), wTc)
+        values.insert(P(0), Point3(point_w))
+        values.insert(A(0), alpha)
+        return values
+
+    def test_unimodal_residual(self):
+        """Residual is (log z_pred - log d - alpha) / rel_sigma."""
+        d, rel_sigma = 2.5, 0.05
+        factor = make_log_depth_factor(X(0), P(0), A(0), [d], [rel_sigma], [0.0], UNIT_NOISE)
+        residual = factor.unwhitenedError(self.values)
+        self.assertAlmostEqual(residual[0], (np.log(3.0) - np.log(d) - self.alpha) / rel_sigma, places=9)
+
+    def test_alpha_shifts_mode_selection(self):
+        """Both modes share alpha, so mode selection runs on bias-corrected residuals."""
+        # z_pred = 3.0. With alpha = 0: log 3 - log 2 = 0.405 vs log 3 - log 4 = -0.288 -> far mode wins.
+        factor = make_log_depth_factor(X(0), P(0), A(0), [2.0, 4.0], [0.1, 0.1], [0.0, 0.0], UNIT_NOISE)
+        values = self._make_values(self.wTc, self.point_w, 0.0)
+        self.assertAlmostEqual(factor.unwhitenedError(values)[0], (np.log(3.0) - np.log(4.0)) / 0.1, places=9)
+        # With alpha = 0.405 (image depths biased small), the near mode wins instead.
+        alpha = float(np.log(3.0) - np.log(2.0))
+        values = self._make_values(self.wTc, self.point_w, alpha)
+        self.assertAlmostEqual(factor.unwhitenedError(values)[0], 0.0, places=9)
+
+    def test_null_hypothesis_opts_out(self):
+        """If even the best mode is > null_nsigma away, residual and Jacobians are zero."""
+        factor = make_log_depth_factor(X(0), P(0), A(0), [0.1], [0.01], [0.0], UNIT_NOISE, null_nsigma=3.0)
+        self.assertAlmostEqual(factor.unwhitenedError(self.values)[0], 0.0, places=9)
+        A_mat, b = factor.linearize(self.values).jacobian()
+        np.testing.assert_allclose(A_mat, 0.0, atol=1e-12)
+
+    def test_behind_camera_opts_out(self):
+        """Non-positive predicted depth disables the factor instead of taking log of z <= 0."""
+        point_c_behind = np.array([0.4, -0.2, -1.0])
+        point_w_behind = self.wTc.transformFrom(Point3(point_c_behind))
+        values = self._make_values(self.wTc, point_w_behind, self.alpha)
+        factor = make_log_depth_factor(X(0), P(0), A(0), [2.5], [0.05], [0.0], UNIT_NOISE)
+        self.assertAlmostEqual(factor.unwhitenedError(values)[0], 0.0, places=9)
+        A_mat, b = factor.linearize(values).jacobian()
+        np.testing.assert_allclose(A_mat, 0.0, atol=1e-12)
+
+    def test_jacobians_match_finite_differences(self):
+        """Analytic Jacobians (pose, point, alpha) agree with central finite differences."""
+        factor = make_log_depth_factor(X(0), P(0), A(0), [1.0, 3.5], [0.05, 0.08], [0.0, 0.0], UNIT_NOISE)
+        A_mat, _ = factor.linearize(self.values).jacobian()
+        # Columns: [pose (6), point (3), alpha (1)]; unit noise, so A is the raw Jacobian.
+        H_pose, H_point, H_alpha = A_mat[:, :6], A_mat[:, 6:9], A_mat[:, 9:]
+
+        eps = 1e-6
+
+        def residual(wTc: Pose3, point_w: np.ndarray, alpha: float) -> float:
+            return factor.unwhitenedError(self._make_values(wTc, point_w, alpha))[0]
+
+        for k in range(6):
+            delta = np.zeros(6)
+            delta[k] = eps
+            r_plus = residual(self.wTc.retract(delta), self.point_w, self.alpha)
+            r_minus = residual(self.wTc.retract(-delta), self.point_w, self.alpha)
+            self.assertAlmostEqual(H_pose[0, k], (r_plus - r_minus) / (2 * eps), places=4)
+
+        for k in range(3):
+            delta = np.zeros(3)
+            delta[k] = eps
+            r_plus = residual(self.wTc, self.point_w + delta, self.alpha)
+            r_minus = residual(self.wTc, self.point_w - delta, self.alpha)
+            self.assertAlmostEqual(H_point[0, k], (r_plus - r_minus) / (2 * eps), places=4)
+
+        r_plus = residual(self.wTc, self.point_w, self.alpha + eps)
+        r_minus = residual(self.wTc, self.point_w, self.alpha - eps)
+        self.assertAlmostEqual(H_alpha[0, 0], (r_plus - r_minus) / (2 * eps), places=4)
 
 
 class TestDepthProviderHypotheses(unittest.TestCase):

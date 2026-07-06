@@ -14,9 +14,16 @@ import dask
 import gtsam  # type: ignore
 import numpy as np
 from dask.delayed import Delayed
-from gtsam import BetweenFactorPose3, NonlinearFactorGraph, PriorFactorPoint3, PriorFactorPose3, Values  # type: ignore
+from gtsam import (  # type: ignore
+    BetweenFactorPose3,
+    NonlinearFactorGraph,
+    PriorFactorDouble,
+    PriorFactorPoint3,
+    PriorFactorPose3,
+    Values,
+)
 from gtsam.noiseModel import Diagonal, Isotropic, Robust, mEstimator  # type: ignore
-from gtsam.symbol_shorthand import K, P, X  # type: ignore
+from gtsam.symbol_shorthand import A, K, P, X  # type: ignore
 from numpy.typing import NDArray
 
 import gtsfm.common.types as gtsfm_types
@@ -189,6 +196,64 @@ def make_mixture_depth_factor(
     return gtsam.CustomFactor(noise, [pose_key, lm_key], error_func)
 
 
+def make_log_depth_factor(
+    pose_key, lm_key, alpha_key, depths, rel_sigmas, log_weights, noise, null_nsigma=None
+) -> "gtsam.CustomFactor":
+    """Log-space max-mixture depth factor with a per-image scale offset alpha_i (N>=1 modes).
+
+    Residual for mode k is ``(log z_pred - log d_k - alpha_i) / rel_sigma_k``: a per-image
+    multiplicative depth bias z = a_i * d becomes the additive offset alpha_i = log a_i,
+    which enters the residual linearly (Jacobian -1/sigma). With alpha_i free, the factor
+    constrains only depth *structure* (within-image log-depth ratios, tied across images
+    through shared landmarks); the mean of the alphas is scale gauge. ``rel_sigmas`` are
+    log-space sigmas (~ fractional depth error, sigma_k / d_k to first order), so a constant
+    value encodes error growing proportionally with depth.
+
+    Mode selection and the ``null_nsigma`` opt-out mirror ``make_mixture_depth_factor``;
+    N=1 is the unimodal case and N=2 with equal sigma/weight the bimodal one. Both modes
+    share alpha_i, so mode selection runs on bias-corrected residuals. A non-positive
+    predicted depth (point at/behind the camera during optimization) opts out the same
+    way as the null hypothesis, since log z is undefined there.
+    """
+    log_depths = np.log(np.asarray(depths, dtype=np.float64))
+    rel_sigmas = np.asarray(rel_sigmas, dtype=np.float64)
+    log_weights = np.asarray(log_weights, dtype=np.float64)
+
+    def error_func(this, values, H):
+        pose_wTc = values.atPose3(pose_key)
+        point_w = values.atPoint3(lm_key)
+        alpha = values.atDouble(alpha_key)
+
+        H_pose = np.zeros((3, 6), dtype=np.float64, order="F")
+        H_point = np.zeros((3, 3), dtype=np.float64, order="F")
+
+        point_c = pose_wTc.transformTo(point_w, H_pose, H_point)
+        z_pred = float(point_c[2])
+        if z_pred <= 1e-9:
+            if H is not None:
+                H[0] = np.zeros((1, 6), dtype=np.float64)
+                H[1] = np.zeros((1, 3), dtype=np.float64)
+                H[2] = np.zeros((1, 1), dtype=np.float64)
+            return np.array([0.0], dtype=np.float64)
+        r = (np.log(z_pred) - log_depths - alpha) / rel_sigmas
+        k = int(np.argmin(0.5 * r * r + np.log(rel_sigmas)))  # temporarily uniform prior
+        if null_nsigma is not None and abs(r[k]) > null_nsigma:
+            # Null hypothesis selected: no mode fits the geometry -> disable the depth term here.
+            if H is not None:
+                H[0] = np.zeros((1, 6), dtype=np.float64)
+                H[1] = np.zeros((1, 3), dtype=np.float64)
+                H[2] = np.zeros((1, 1), dtype=np.float64)
+            return np.array([0.0], dtype=np.float64)
+        if H is not None:
+            # d(log z)/dx = (1/z) * dz/dx, whitened by the selected mode's sigma.
+            H[0] = H_pose[2:3, :] / (z_pred * rel_sigmas[k])
+            H[1] = H_point[2:3, :] / (z_pred * rel_sigmas[k])
+            H[2] = np.array([[-1.0 / rel_sigmas[k]]], dtype=np.float64)
+        return np.array([r[k]], dtype=np.float64)
+
+    return gtsam.CustomFactor(noise, [pose_key, lm_key, alpha_key], error_func)
+
+
 def multi_view_retriangulate_from_2d_tracks(
     gtsfm_data: GtsfmData,
     tracks_2d: List["SfmTrack2d"],
@@ -324,6 +389,8 @@ class BundleAdjustmentOptions:
     depth_gmm_sigma_floor: float = 0.05  # GMM: relative floor on per-mode sigma (frac of mode depth)
     depth_null_nsigma: Optional[float] = None  # mixture null hypothesis: opt out if best mode > N sigmas off (None=off)
     depth_auto_scale: bool = False  # divide metric depth by a robust global recon<-metric scale before BA (classical SfM)
+    depth_log_alpha: bool = False  # log-depth residuals with a free per-image scale offset alpha_i (structure-only)
+    depth_alpha_sigma: Optional[float] = 1.0  # prior sigma on alpha_i about the shared init scale (None = free)
     # GT null-hypothesis gate (oracle diagnostic): drop a measurement's depth factor unless some mode
     # backprojects within depth_gt_tau of the GT cloud. Isolates whether bad candidates (vs the BA
     # mechanism) are the bottleneck. Requires the GT cloud + the COLMAP GT-pose dir.
@@ -380,6 +447,8 @@ class BundleAdjustmentOptions:
             depth_gmm_sigma_floor=self.depth_gmm_sigma_floor,
             depth_null_nsigma=self.depth_null_nsigma,
             depth_auto_scale=self.depth_auto_scale,
+            depth_log_alpha=self.depth_log_alpha,
+            depth_alpha_sigma=self.depth_alpha_sigma,
             depth_gt_gate=self.depth_gt_gate,
             depth_gt_ply=self.depth_gt_ply,
             depth_gt_align_ref=self.depth_gt_align_ref,
@@ -459,6 +528,8 @@ class BundleAdjustmentOptimizer:
         depth_gmm_sigma_floor: float = 0.05,
         depth_null_nsigma: Optional[float] = None,
         depth_auto_scale: bool = False,
+        depth_log_alpha: bool = False,
+        depth_alpha_sigma: Optional[float] = 1.0,
         depth_gt_gate: bool = False,
         depth_gt_ply: Optional[str] = None,
         depth_gt_align_ref: Optional[str] = None,
@@ -565,6 +636,8 @@ class BundleAdjustmentOptimizer:
         self._depth_gmm_sigma_floor = depth_gmm_sigma_floor
         self._depth_null_nsigma = depth_null_nsigma
         self._depth_auto_scale = depth_auto_scale
+        self._depth_log_alpha = depth_log_alpha
+        self._depth_alpha_sigma = depth_alpha_sigma
         self._depth_gt_gate = depth_gt_gate
         self._depth_gt_ply = depth_gt_ply
         self._depth_gt_align_ref = depth_gt_align_ref
@@ -574,6 +647,9 @@ class BundleAdjustmentOptimizer:
         self._image_fnames: Optional[Dict[int, str]] = None
         self._depth_arrays: Optional[Dict[int, np.ndarray]] = None
         self._depth_factor_stats: Dict[str, int] = {"unimodal": 0, "bimodal": 0, "dropped_ambiguous": 0, "skipped": 0}
+        # Per-image alpha_i inits for the log-depth factors (set by __depth_factors, consumed
+        # by __optimize_and_recover when populating initial Values).
+        self._depth_alpha_init: Dict[int, float] = {}
         self._depth_provider = None
 
         # Post-BA multi-view retriangulation (opt-in). See `__init__` docstring above.
@@ -880,6 +956,32 @@ class BundleAdjustmentOptimizer:
             depth_noise = Robust(mEstimator.Huber(self._robust_noise_basin), depth_noise)
             unit_noise = Robust(mEstimator.Huber(self._robust_noise_basin), unit_noise)
 
+        # Log-alpha mode: every factor becomes a log-space mixture (N>=1) sharing a per-image
+        # offset alpha_i = log a_i that absorbs the MDE's multiplicative depth bias. Sigmas
+        # become relative (sigma_k / d_k), which is sf-invariant, so sf only shifts the alphas.
+        log_alpha = self._depth_log_alpha
+        sigma_m = self._depth_factor_sigma  # metric sigma, converted per-measurement to log space
+        alpha_cams: set[int] = set()
+        alpha_obs: Dict[int, List[float]] = defaultdict(list)
+        self._depth_alpha_init = {}
+        init_poses = {i: initial_data.get_camera(i).pose() for i in cameras_to_model} if log_alpha else {}
+
+        def push_log_factor(i, j, point_w, modes, rel_sigmas, log_ws, null_nsigma=None) -> None:
+            graph.push_back(
+                make_log_depth_factor(
+                    X(i), P(j), A(i),
+                    [m / sf for m in modes], rel_sigmas, log_ws, unit_noise, null_nsigma=null_nsigma,
+                )
+            )
+            alpha_cams.add(i)
+            # alpha_i init observation: log z_init - log d for the init-closest mode. The per-image
+            # median absorbs the global recon<->metric scale (subsuming depth_auto_scale) and warm-starts
+            # mode selection on bias-corrected residuals.
+            z0 = float(init_poses[i].transformTo(point_w)[2])
+            if z0 > 0:
+                log_r = np.log(z0) - np.log(np.asarray(modes, dtype=np.float64) / sf)
+                alpha_obs[i].append(float(log_r[np.argmin(np.abs(log_r))]))
+
         n_unimodal = 0
         n_bimodal = 0
         n_dropped_ambiguous = 0
@@ -909,23 +1011,35 @@ class BundleAdjustmentOptimizer:
                         continue
                     if self._depth_gt_oracle_select and best_mode is not None:
                         # Mode-selection ceiling: collapse to the GT-closest hypothesis (unimodal).
-                        graph.push_back(make_depth_factor(X(i), P(j), best_mode / sf, depth_noise))
+                        if log_alpha:
+                            push_log_factor(i, j, track.point3(), [best_mode], [sigma_m / best_mode], [0.0])
+                        else:
+                            graph.push_back(make_depth_factor(X(i), P(j), best_mode / sf, depth_noise))
                         n_unimodal += 1
                         continue
                 if sample.is_mixture:
                     # Weighted max-mixture factor (no gating). The provider returns final per-mode
                     # sigmas in depth units (MDA bakes in its sigma_rel; GMM uses its fitted sigmas),
                     # so they are passed through directly here.
-                    graph.push_back(
-                        make_mixture_depth_factor(
-                            X(i), P(j),
-                            [d / sf for d in sample.depths],
-                            [s_ / sf for s_ in sample.sigmas],
+                    if log_alpha:
+                        push_log_factor(
+                            i, j, track.point3(),
+                            list(sample.depths),
+                            [s_ / d for s_, d in zip(sample.sigmas, sample.depths)],
                             list(sample.log_weights),
-                            unit_noise,
                             null_nsigma=self._depth_null_nsigma,
                         )
-                    )
+                    else:
+                        graph.push_back(
+                            make_mixture_depth_factor(
+                                X(i), P(j),
+                                [d / sf for d in sample.depths],
+                                [s_ / sf for s_ in sample.sigmas],
+                                list(sample.log_weights),
+                                unit_noise,
+                                null_nsigma=self._depth_null_nsigma,
+                            )
+                        )
                     n_bimodal += 1
                     continue
                 if sample.ambiguous and self._depth_model == DepthFactorMode.DROP_AMBIGUOUS:
@@ -933,14 +1047,42 @@ class BundleAdjustmentOptimizer:
                     continue
                 if sample.ambiguous and self._depth_model == DepthFactorMode.BIMODAL:
                     assert sample.depth_alt is not None
-                    graph.push_back(
-                        make_bimodal_depth_factor(X(i), P(j), sample.depth / sf, sample.depth_alt / sf, depth_noise)
-                    )
+                    if log_alpha:
+                        push_log_factor(
+                            i, j, track.point3(),
+                            [sample.depth, sample.depth_alt],
+                            [sigma_m / sample.depth, sigma_m / sample.depth_alt],
+                            [0.0, 0.0],
+                        )
+                    else:
+                        graph.push_back(
+                            make_bimodal_depth_factor(X(i), P(j), sample.depth / sf, sample.depth_alt / sf, depth_noise)
+                        )
                     n_bimodal += 1
                 else:
-                    graph.push_back(make_depth_factor(X(i), P(j), sample.depth / sf, depth_noise))
+                    if log_alpha:
+                        push_log_factor(i, j, track.point3(), [sample.depth], [sigma_m / sample.depth], [0.0])
+                    else:
+                        graph.push_back(make_depth_factor(X(i), P(j), sample.depth / sf, depth_noise))
                     n_unimodal += 1
 
+        if log_alpha and alpha_cams:
+            # Weak prior centered on the shared init scale (not zero): it penalizes per-image
+            # *deviation* from the common scale — the structure signal — while the common scale
+            # itself stays gauge. Also keeps alpha_i conditioned for images with few factors.
+            medians = {i: float(np.median(v)) for i, v in alpha_obs.items()}
+            alpha_center = float(np.median(list(medians.values()))) if medians else 0.0
+            self._depth_alpha_init = {i: medians.get(i, alpha_center) for i in alpha_cams}
+            if self._depth_alpha_sigma is not None:
+                alpha_noise = Isotropic.Sigma(1, self._depth_alpha_sigma)
+                for i in self._depth_alpha_init:
+                    graph.push_back(PriorFactorDouble(A(i), alpha_center, alpha_noise))
+            logger.info(
+                "Log-depth alpha: %d per-image offsets (init center=%.3f, prior sigma=%s).",
+                len(self._depth_alpha_init),
+                alpha_center,
+                str(self._depth_alpha_sigma),
+            )
         logger.info(
             "Depth factors (%s): %d unimodal, %d bimodal, %d ambiguous dropped, %d skipped, %d GT-gated.",
             self._depth_model.value,
@@ -956,6 +1098,7 @@ class BundleAdjustmentOptimizer:
             "dropped_ambiguous": n_dropped_ambiguous,
             "skipped": n_skipped,
             "gt_gated": n_gt_gated,
+            "alpha_cams": len(self._depth_alpha_init),
         }
         return graph
 
@@ -1209,8 +1352,16 @@ class BundleAdjustmentOptimizer:
     ) -> Tuple[GtsfmData, Values, float, List[bool]]:
         """Optimize the graph, report errors, and convert `Values` back to `GtsfmData`."""
         initial_values = initial_data.to_values(shared_calib=self._shared_calib)
+        for i, alpha0 in self._depth_alpha_init.items():
+            initial_values.insert(A(i), alpha0)
         result_values, _, weights = self.__optimize_factor_graph(graph, initial_values, ordering_type)
         final_error = graph.error(result_values)
+        if self._depth_alpha_init:
+            alphas = np.array([result_values.atDouble(A(i)) for i in sorted(self._depth_alpha_init)])
+            logger.info(
+                "Optimized depth alphas (log-scale offsets): mean=%.3f std=%.3f min=%.3f max=%.3f.",
+                alphas.mean(), alphas.std(), alphas.min(), alphas.max(),
+            )
         optimized_data = GtsfmData.from_values(result_values, initial_data, self._shared_calib)
         gnc_valid_mask = [True] * initial_data.number_tracks()
         if self._use_gnc and weights is not None and self._factor_weight_outlier_threshold > 0:
