@@ -327,10 +327,12 @@ class MdaNpzDepthProvider:
                 self._cache[image_id] = None
             else:
                 z = np.load(path)
+                # float32, not float64: the cache holds every image's full mixture (~9 float planes),
+                # which is tens of GB at float64 on large scenes (e.g. T&T, 371 images).
                 data = {
-                    "decoded": z["decoded"].astype(np.float64),
-                    "means": z["means"].astype(np.float64),
-                    "weights": z["weights"].astype(np.float64),
+                    "decoded": z["decoded"].astype(np.float32),
+                    "means": z["means"].astype(np.float32),
+                    "weights": z["weights"].astype(np.float32),
                 }
                 if "sky_mask" in z:
                     data["sky_mask"] = z["sky_mask"].astype(bool)

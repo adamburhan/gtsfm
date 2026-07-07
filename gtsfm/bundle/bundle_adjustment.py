@@ -1146,6 +1146,9 @@ class BundleAdjustmentOptimizer:
             "gt_gated": n_gt_gated,
             "alpha_cams": len(self._depth_alpha_init),
         }
+        # The factors hold copies of the depths; drop the provider's per-image cache (GBs on large
+        # scenes) before the optimization. Lazily rebuilt if a later BA call needs it.
+        self._depth_provider = None
         return graph
 
     def _between_factors(
