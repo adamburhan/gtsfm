@@ -11,7 +11,7 @@ module load cuda/12.6.0
 export PYTHONHASHSEED=0   # deterministic set/dict-hash ordering (must be set before python starts)
 
 SEQ=${1:?usage: unified_eth3d_depthpro_sweep.sh <seq> <mode> <gap> <sweep_name> <depth_subdir> <gt_scale> <gt_gate> <auto_scale>}
-MODE=${2:?mode: none | unimodal | bimodal_gap | bimodal_gmm | bimodal_gmm_null | unimodal_log | bimodal_log}
+MODE=${2:?mode: none | unimodal | bimodal_gap | bimodal_gmm | bimodal_gmm_null | unimodal_log | bimodal_log | mda_unimodal_log | mda_multimodal4_log}
 GAPTHRESH=${3:-0.10}
 # Args 4-8 are the knobs that vary across the table. cluv submit does not forward env vars to the
 # job, so they are passed positionally. The rest are fixed defaults below.
@@ -27,6 +27,7 @@ GT_TAU=0.1                         # gate band (m): a mode this close to GT coun
 GT_ORACLE=false                    # also collapse to the GT-closest mode (mode-selection ceiling)
 PATCH_RADIUS=3                     # half-size of the patch for gap/GMM ambiguity analysis
 ALPHA_SIGMA=1.0                    # *_log modes: prior sigma on alpha_i about the shared init scale
+SIGMA_LOG=0.05                     # mda_* modes: shared log-space (relative) sigma for all components
 GS_STEPS=7000                      # Gaussian-splatting training steps for the NVS eval
 
 project_name="gtsfm"
@@ -80,6 +81,14 @@ DEPTH_COMMON="$BA.depth_map_dir=$DEPTH_DIR \
     $BA.depth_gt_gate=$GT_GATE $BA.depth_gt_ply=$GT_MESH $BA.depth_gt_align_ref=$COLMAP_DIR \
     $BA.depth_gt_tau=$GT_TAU $BA.depth_gt_oracle_select=$GT_ORACLE $BA.depth_gt_scale=$GT_SCALE"
 
+MDA_COMMON="$BA.depth_mda_npz_dir=$DATA/$SEQ/$DEPTH_SUBDIR \
+    $BA.depth_log_alpha=true $BA.depth_alpha_sigma=$ALPHA_SIGMA \
+    $BA.depth_factor_sigma_log=$SIGMA_LOG \
+    $BA.depth_factor_robust_loss=true \
+    $BA.depth_auto_scale=$AUTO_SCALE \
+    $BA.depth_gt_gate=$GT_GATE $BA.depth_gt_ply=$GT_MESH $BA.depth_gt_align_ref=$COLMAP_DIR \
+    $BA.depth_gt_tau=$GT_TAU $BA.depth_gt_oracle_select=$GT_ORACLE $BA.depth_gt_scale=$GT_SCALE"
+
 DEPTH_ARGS=""
 case "$MODE" in
     none) DEPTH_ARGS="$BA.depth_model=none" ;;
@@ -95,6 +104,11 @@ case "$MODE" in
         $BA.depth_alpha_sigma=$ALPHA_SIGMA $DEPTH_COMMON" ;;
     bimodal_log) DEPTH_ARGS="$BA.depth_model=bimodal $BA.depth_hypothesis_method=gmm $BA.depth_log_alpha=true \
         $BA.depth_alpha_sigma=$ALPHA_SIGMA $DEPTH_COMMON" ;;
+    # mda_*: raw MDA npz mixtures (DEPTH_SUBDIR = npz dir, e.g. depth_mda_760). Relative depth:
+    # no depth_map_dir, metric min/max bypassed by the provider; shared log-space sigma for both
+    # conditions (uni-vs-multi differ only in the mode set). Weights are diagnostics-only.
+    mda_unimodal_log) DEPTH_ARGS="$BA.depth_model=unimodal $MDA_COMMON" ;;
+    mda_multimodal4_log) DEPTH_ARGS="$BA.depth_model=bimodal $MDA_COMMON" ;;
     *) echo "unknown mode: $MODE" >&2; exit 1 ;;
 esac
 

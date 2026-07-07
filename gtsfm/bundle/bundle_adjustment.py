@@ -31,7 +31,7 @@ import gtsfm.utils.logger as logger_utils
 import gtsfm.utils.metrics as metrics_utils
 import gtsfm.utils.tracks as track_utils
 from gtsfm.common import gtsfm_data
-from gtsfm.common.depth_provider import DepthProvider, MdaDepthProvider
+from gtsfm.common.depth_provider import DepthProvider, MdaDepthProvider, MdaNpzDepthProvider
 from gtsfm.common.gtsfm_data import GtsfmData
 from gtsfm.common.pose_prior import PosePrior
 from gtsfm.common.sfm_track import SfmTrack2d
@@ -384,6 +384,8 @@ class BundleAdjustmentOptions:
     depth_mda_dir: Optional[str] = None  # precomputed MDA mixtures (dump_mda_mixture); overrides patch modes
     depth_mda_sigma_rel: float = 0.05    # MDA mixture sigma RELATIVE to depth (sigma = rel*depth); scale-invariant
     depth_mda_near_prior: float = 0.3    # slight log-weight penalty per depth rank (nearer mode preferred)
+    depth_mda_npz_dir: Optional[str] = None  # raw MDA npz source (<image-stem>.npz); requires depth_log_alpha
+    depth_factor_sigma_log: Optional[float] = None  # shared log-space (relative) sigma; None = convert metric sigma
     depth_hypothesis_method: str = "gap"  # "gap" (largest-gap heuristic) | "gmm" (2-component GMM)
     depth_gmm_min_weight: float = 0.15   # GMM: min mass on the smaller mode to flag a sample ambiguous
     depth_gmm_sigma_floor: float = 0.05  # GMM: relative floor on per-mode sigma (frac of mode depth)
@@ -442,6 +444,8 @@ class BundleAdjustmentOptions:
             depth_mda_dir=self.depth_mda_dir,
             depth_mda_sigma_rel=self.depth_mda_sigma_rel,
             depth_mda_near_prior=self.depth_mda_near_prior,
+            depth_mda_npz_dir=self.depth_mda_npz_dir,
+            depth_factor_sigma_log=self.depth_factor_sigma_log,
             depth_hypothesis_method=self.depth_hypothesis_method,
             depth_gmm_min_weight=self.depth_gmm_min_weight,
             depth_gmm_sigma_floor=self.depth_gmm_sigma_floor,
@@ -523,6 +527,8 @@ class BundleAdjustmentOptimizer:
         depth_mda_dir: Optional[str] = None,
         depth_mda_sigma_rel: float = 0.05,
         depth_mda_near_prior: float = 0.3,
+        depth_mda_npz_dir: Optional[str] = None,
+        depth_factor_sigma_log: Optional[float] = None,
         depth_hypothesis_method: str = "gap",
         depth_gmm_min_weight: float = 0.15,
         depth_gmm_sigma_floor: float = 0.05,
@@ -631,6 +637,8 @@ class BundleAdjustmentOptimizer:
         self._depth_mda_dir = depth_mda_dir
         self._depth_mda_sigma_rel = depth_mda_sigma_rel
         self._depth_mda_near_prior = depth_mda_near_prior
+        self._depth_mda_npz_dir = depth_mda_npz_dir
+        self._depth_factor_sigma_log = depth_factor_sigma_log
         self._depth_hypothesis_method = depth_hypothesis_method
         self._depth_gmm_min_weight = depth_gmm_min_weight
         self._depth_gmm_sigma_floor = depth_gmm_sigma_floor
@@ -650,6 +658,9 @@ class BundleAdjustmentOptimizer:
         # Per-image alpha_i inits for the log-depth factors (set by __depth_factors, consumed
         # by __optimize_and_recover when populating initial Values).
         self._depth_alpha_init: Dict[int, float] = {}
+        # Per-mixture-factor records (i, j, log_modes, rel_sigmas, top_weight_idx) for the
+        # converged-winner diagnostic (set by __depth_factors, read by __optimize_and_recover).
+        self._depth_mixture_diag: list = []
         self._depth_provider = None
 
         # Post-BA multi-view retriangulation (opt-in). See `__init__` docstring above.
@@ -725,7 +736,21 @@ class BundleAdjustmentOptimizer:
         if self._depth_provider is not None:
             return self._depth_provider
         compute_hypotheses = self._depth_model in (DepthFactorMode.DROP_AMBIGUOUS, DepthFactorMode.BIMODAL)
-        if self._depth_mda_dir is not None:
+        if self._depth_mda_npz_dir is not None:
+            # Raw MDA mixtures on the loader grid. MDA depth is relative, so the metric sigma /
+            # depth_min/max conventions don't apply: the log-alpha factors (+ depth_factor_sigma_log)
+            # are the only sound noise model for it.
+            if not self._depth_log_alpha:
+                raise ValueError("depth_mda_npz_dir requires depth_log_alpha=true (relative depth source).")
+            if self._image_fnames is None:
+                logger.warning("depth_mda_npz_dir set but image filenames unavailable; skipping depth factors.")
+                return None
+            self._depth_provider = MdaNpzDepthProvider(
+                self._depth_mda_npz_dir,
+                self._image_fnames,
+                multimodal=(self._depth_model == DepthFactorMode.BIMODAL),
+            )
+        elif self._depth_mda_dir is not None:
             # MDA mixture modes, aligned per-image to the in-memory VGGT depth (the affine fix).
             self._depth_provider = MdaDepthProvider(
                 self._depth_mda_dir,
@@ -961,12 +986,16 @@ class BundleAdjustmentOptimizer:
         # become relative (sigma_k / d_k), which is sf-invariant, so sf only shifts the alphas.
         log_alpha = self._depth_log_alpha
         sigma_m = self._depth_factor_sigma  # metric sigma, converted per-measurement to log space
+        sigma_log = self._depth_factor_sigma_log  # shared log-space sigma override (None = convert metric)
+        use_dec_init = self._depth_mda_npz_dir is not None  # alpha init from decoded depth, mode-independent
         alpha_cams: set[int] = set()
         alpha_obs: Dict[int, List[float]] = defaultdict(list)
         self._depth_alpha_init = {}
+        self._depth_mixture_diag = []
         init_poses = {i: initial_data.get_camera(i).pose() for i in cameras_to_model} if log_alpha else {}
 
-        def push_log_factor(i, j, point_w, modes, rel_sigmas, log_ws, null_nsigma=None) -> None:
+        def push_log_factor(i, j, point_w, modes, rel_sigmas, log_ws, null_nsigma=None, d_init=None, top_idx=None) -> None:
+            log_modes = np.log(np.asarray(modes, dtype=np.float64) / sf)
             graph.push_back(
                 make_log_depth_factor(
                     X(i), P(j), A(i),
@@ -974,13 +1003,22 @@ class BundleAdjustmentOptimizer:
                 )
             )
             alpha_cams.add(i)
-            # alpha_i init observation: log z_init - log d for the init-closest mode. The per-image
-            # median absorbs the global recon<->metric scale (subsuming depth_auto_scale) and warm-starts
-            # mode selection on bias-corrected residuals.
+            if len(modes) > 1:
+                # Converged-winner diagnostic (recomputed against the optimized values in
+                # __optimize_and_recover): which mode each mixture factor settled on, and whether
+                # it differs from the top-weight component (weights never enter the optimization).
+                self._depth_mixture_diag.append((i, j, tuple(log_modes), tuple(rel_sigmas), top_idx))
+            # alpha_i init observation: log z_init - log d. `d_init` (e.g. MDA's decoded depth) makes the
+            # warm start mode-independent; otherwise the init-closest mode is used. The per-image median
+            # absorbs the global recon<->metric scale (subsuming depth_auto_scale) and warm-starts mode
+            # selection on bias-corrected residuals.
             z0 = float(init_poses[i].transformTo(point_w)[2])
             if z0 > 0:
-                log_r = np.log(z0) - np.log(np.asarray(modes, dtype=np.float64) / sf)
-                alpha_obs[i].append(float(log_r[np.argmin(np.abs(log_r))]))
+                if d_init is not None:
+                    alpha_obs[i].append(float(np.log(z0) - np.log(d_init / sf)))
+                else:
+                    log_r = np.log(z0) - log_modes
+                    alpha_obs[i].append(float(log_r[np.argmin(np.abs(log_r))]))
 
         n_unimodal = 0
         n_bimodal = 0
@@ -1012,7 +1050,8 @@ class BundleAdjustmentOptimizer:
                     if self._depth_gt_oracle_select and best_mode is not None:
                         # Mode-selection ceiling: collapse to the GT-closest hypothesis (unimodal).
                         if log_alpha:
-                            push_log_factor(i, j, track.point3(), [best_mode], [sigma_m / best_mode], [0.0])
+                            rel = [sigma_log] if sigma_log is not None else [sigma_m / best_mode]
+                            push_log_factor(i, j, track.point3(), [best_mode], rel, [0.0])
                         else:
                             graph.push_back(make_depth_factor(X(i), P(j), best_mode / sf, depth_noise))
                         n_unimodal += 1
@@ -1022,12 +1061,19 @@ class BundleAdjustmentOptimizer:
                     # sigmas in depth units (MDA bakes in its sigma_rel; GMM uses its fitted sigmas),
                     # so they are passed through directly here.
                     if log_alpha:
+                        if sigma_log is not None:
+                            rel = [sigma_log] * len(sample.depths)
+                        else:
+                            rel = [s_ / d for s_, d in zip(sample.sigmas, sample.depths)]
+                        top_idx = int(np.argmax(sample.log_weights)) if use_dec_init and sample.log_weights else None
                         push_log_factor(
                             i, j, track.point3(),
                             list(sample.depths),
-                            [s_ / d for s_, d in zip(sample.sigmas, sample.depths)],
+                            rel,
                             list(sample.log_weights),
                             null_nsigma=self._depth_null_nsigma,
+                            d_init=sample.depth if use_dec_init else None,
+                            top_idx=top_idx,
                         )
                     else:
                         graph.push_back(
@@ -1048,12 +1094,11 @@ class BundleAdjustmentOptimizer:
                 if sample.ambiguous and self._depth_model == DepthFactorMode.BIMODAL:
                     assert sample.depth_alt is not None
                     if log_alpha:
-                        push_log_factor(
-                            i, j, track.point3(),
-                            [sample.depth, sample.depth_alt],
-                            [sigma_m / sample.depth, sigma_m / sample.depth_alt],
-                            [0.0, 0.0],
-                        )
+                        if sigma_log is not None:
+                            rel = [sigma_log, sigma_log]
+                        else:
+                            rel = [sigma_m / sample.depth, sigma_m / sample.depth_alt]
+                        push_log_factor(i, j, track.point3(), [sample.depth, sample.depth_alt], rel, [0.0, 0.0])
                     else:
                         graph.push_back(
                             make_bimodal_depth_factor(X(i), P(j), sample.depth / sf, sample.depth_alt / sf, depth_noise)
@@ -1061,7 +1106,8 @@ class BundleAdjustmentOptimizer:
                     n_bimodal += 1
                 else:
                     if log_alpha:
-                        push_log_factor(i, j, track.point3(), [sample.depth], [sigma_m / sample.depth], [0.0])
+                        rel = [sigma_log] if sigma_log is not None else [sigma_m / sample.depth]
+                        push_log_factor(i, j, track.point3(), [sample.depth], rel, [0.0])
                     else:
                         graph.push_back(make_depth_factor(X(i), P(j), sample.depth / sf, depth_noise))
                     n_unimodal += 1
@@ -1362,6 +1408,30 @@ class BundleAdjustmentOptimizer:
                 "Optimized depth alphas (log-scale offsets): mean=%.3f std=%.3f min=%.3f max=%.3f.",
                 alphas.mean(), alphas.std(), alphas.min(), alphas.max(),
             )
+        if self._depth_mixture_diag:
+            # Winning component per mixture factor at convergence (same selection rule as the factor),
+            # and the fraction whose winner is NOT the top-weight component. ~0 -> the mixture did
+            # nothing; a few % -> it actively re-assigned surfaces. Weights never enter optimization.
+            pose_cache = {i: result_values.atPose3(X(i)) for i in {e[0] for e in self._depth_mixture_diag}}
+            alpha_cache = {i: result_values.atDouble(A(i)) for i in pose_cache}
+            winners, n_weighted, n_not_top = [], 0, 0
+            for i, j, log_modes, rel_sigmas, top_idx in self._depth_mixture_diag:
+                z = float(pose_cache[i].transformTo(result_values.atPoint3(P(j)))[2])
+                if z <= 0:
+                    continue
+                r = (np.log(z) - np.array(log_modes) - alpha_cache[i]) / np.array(rel_sigmas)
+                k = int(np.argmin(0.5 * r * r + np.log(rel_sigmas)))
+                winners.append(k)
+                if top_idx is not None:
+                    n_weighted += 1
+                    n_not_top += int(k != top_idx)
+            hist = np.bincount(winners) if winners else np.array([0])
+            logger.info("Mixture winners at convergence (component index, near->far): %s", hist.tolist())
+            if n_weighted:
+                logger.info(
+                    "Mixture winner != top-weight component: %d/%d (%.2f%%).",
+                    n_not_top, n_weighted, 100.0 * n_not_top / n_weighted,
+                )
         optimized_data = GtsfmData.from_values(result_values, initial_data, self._shared_calib)
         gnc_valid_mask = [True] * initial_data.number_tracks()
         if self._use_gnc and weights is not None and self._factor_weight_outlier_threshold > 0:

@@ -17,7 +17,7 @@ from gtsam import Point3, Pose3, Rot3, Values
 from gtsam.symbol_shorthand import A, P, X  # type: ignore
 
 from gtsfm.bundle.bundle_adjustment import make_bimodal_depth_factor, make_depth_factor, make_log_depth_factor
-from gtsfm.common.depth_provider import DepthProvider
+from gtsfm.common.depth_provider import DepthProvider, MdaNpzDepthProvider
 
 DEPTH_NOISE = gtsam.noiseModel.Isotropic.Sigma(1, 0.1)
 
@@ -187,6 +187,81 @@ class TestLogDepthFactor(unittest.TestCase):
         r_plus = residual(self.wTc, self.point_w, self.alpha + eps)
         r_minus = residual(self.wTc, self.point_w, self.alpha - eps)
         self.assertAlmostEqual(H_alpha[0, 0], (r_plus - r_minus) / (2 * eps), places=4)
+
+
+class TestLogDepthFactorMultimodal(unittest.TestCase):
+    """4-component (MDA-style) behavior of the log-depth factor: fixed point + uniform selection."""
+
+    def setUp(self):
+        super().setUp()
+        self.wTc = Pose3(Rot3.RzRyRx(0.1, -0.2, 0.3), np.array([0.5, -1.0, 2.0]))
+        self.point_c = np.array([0.4, -0.2, 3.0])
+        self.point_w = self.wTc.transformFrom(Point3(self.point_c))
+        self.values = TestLogDepthFactor._make_values(self.wTc, self.point_w, 0.0)
+
+    def test_all_components_at_truth_is_fixed_point(self):
+        """4 components all equal to the true depth -> zero residual and zero gradient at the truth."""
+        factor = make_log_depth_factor(X(0), P(0), A(0), [3.0] * 4, [0.05] * 4, [0.0] * 4, UNIT_NOISE)
+        self.assertAlmostEqual(factor.unwhitenedError(self.values)[0], 0.0, places=9)
+        _, b = factor.linearize(self.values).jacobian()
+        np.testing.assert_allclose(b, 0.0, atol=1e-9)
+
+    def test_selection_is_uniform_weights_inert(self):
+        """Winner is the whitened-closest component; log-weights do not change it (uniform selection)."""
+        modes, sigmas = [1.0, 2.0, 3.5, 6.0], [0.05] * 4
+        # z_pred = 3.0 -> closest in log space is 3.5.
+        expected = (np.log(3.0) - np.log(3.5)) / 0.05
+        for log_ws in ([0.0] * 4, [np.log(0.97), np.log(0.01), np.log(0.01), np.log(0.01)]):
+            factor = make_log_depth_factor(X(0), P(0), A(0), modes, sigmas, log_ws, UNIT_NOISE)
+            self.assertAlmostEqual(factor.unwhitenedError(self.values)[0], expected, places=9)
+
+
+class TestMdaNpzDepthProvider(unittest.TestCase):
+    """Unit tests for the raw MDA npz source (no metric filters, sky mask, diagnostic weights)."""
+
+    K, H, W = 4, 20, 30
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp()
+        self.decoded = np.full((self.H, self.W), 0.5)
+        self.decoded[5, 7] = 0.4  # below the usual 0.3-ish metric floors on purpose
+        self.means = np.tile(np.array([0.4, 0.6, 0.9, 1.2])[:, None, None], (1, self.H, self.W))
+        self.weights = np.tile(np.array([0.5, 0.3, 0.2, 0.0])[:, None, None], (1, self.H, self.W))
+        self.sky = np.zeros((self.H, self.W), dtype=bool)
+        self.sky[2, 3] = True
+        np.savez(
+            Path(self.tmp) / "DSC_0001.npz",
+            decoded=self.decoded, means=self.means, weights=self.weights, sky_mask=self.sky,
+        )
+        self.fnames = {0: "DSC_0001.JPG"}
+
+    def test_exact_values_and_meters_filter_bypass(self):
+        """Keypoint returns the exact npz values; a 0.4 depth (sub-metric-floor) survives."""
+        provider = MdaNpzDepthProvider(self.tmp, self.fnames, multimodal=True)
+        sample = provider.get_depth(0, u=7.2, v=4.8)  # rounds to (row=5, col=7)
+        self.assertIsNotNone(sample)
+        self.assertAlmostEqual(sample.depth, 0.4, places=12)  # decoded, not a mode
+        np.testing.assert_allclose(sample.depths, [0.4, 0.6, 0.9, 1.2])
+        self.assertTrue(sample.is_mixture)
+
+    def test_unimodal_control_returns_decoded_only(self):
+        provider = MdaNpzDepthProvider(self.tmp, self.fnames, multimodal=False)
+        sample = provider.get_depth(0, u=10, v=10)
+        self.assertAlmostEqual(sample.depth, 0.5, places=12)
+        self.assertFalse(sample.is_mixture)
+        self.assertIsNone(sample.depth_alt)
+
+    def test_zero_weight_clamped_finite(self):
+        """w_k = 0 does not produce -inf/NaN in the diagnostic log-weights (1e-4 clamp)."""
+        provider = MdaNpzDepthProvider(self.tmp, self.fnames, multimodal=True)
+        sample = provider.get_depth(0, u=10, v=10)
+        self.assertTrue(np.all(np.isfinite(sample.log_weights)))
+        self.assertAlmostEqual(np.exp(np.array(sample.log_weights)).sum(), 1.0, places=6)
+
+    def test_sky_mask_drops_sample(self):
+        provider = MdaNpzDepthProvider(self.tmp, self.fnames, multimodal=True)
+        self.assertIsNone(provider.get_depth(0, u=3, v=2))
 
 
 class TestDepthProviderHypotheses(unittest.TestCase):

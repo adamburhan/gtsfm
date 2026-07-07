@@ -292,6 +292,87 @@ class DepthProvider:
         )
 
 
+class MdaNpzDepthProvider:
+    """Raw MDA mixture source for the classical pipeline: per-image ``<image-stem>.npz`` mixtures.
+
+    Reads ``decoded`` (h, w), ``means`` (K, h, w), ``weights`` (K, h, w), and optional
+    ``sky_mask`` (h, w) from ``<depth_dir>/<image_stem>.npz`` (same stem convention as the
+    .npy sources). The arrays are already on the pipeline's image grid, so keypoint indexing
+    is identical to :class:`DepthProvider` (nearest pixel). MDA depth is RELATIVE (arbitrary
+    global scale), so validity is finite & > 0 ONLY -- the metric depth_min/depth_max filters
+    deliberately do NOT apply; scale is reconciled downstream (auto_scale sf + the per-image
+    alpha_i in log mode).
+
+    ``multimodal=False`` returns just the decoded depth (the ``mda/unimodal_log`` control);
+    ``multimodal=True`` returns all K component means as an ungated mixture. The mog weights
+    are NOT used for factor selection (selection stays uniform); they are returned in
+    ``log_weights`` (clamped to 1e-4, renormalized) for the winner-vs-top-weight diagnostic
+    only. ``sample.depth`` is always the decoded value: that is what the auto_scale fit and
+    the alpha_i warm start use (one scale per image, mode-independent). A sky-masked pixel
+    returns None, which drops the factor and excludes it from the auto_scale fit.
+    """
+
+    def __init__(self, depth_dir, image_fnames: Dict[int, str], *, multimodal: bool) -> None:
+        self._dir = Path(depth_dir)
+        self._fnames = image_fnames
+        self._multimodal = multimodal
+        self._cache: Dict[int, Optional[Dict[str, np.ndarray]]] = {}
+
+    def _load(self, image_id: int) -> Optional[Dict[str, np.ndarray]]:
+        """Lazily load and cache the per-image mixture npz."""
+        if image_id not in self._cache:
+            path = self._dir / (Path(self._fnames[image_id]).stem + ".npz")
+            if not path.exists():
+                logger.warning("MdaNpzDepthProvider: no mixture for image %d at %s", image_id, path)
+                self._cache[image_id] = None
+            else:
+                z = np.load(path)
+                data = {
+                    "decoded": z["decoded"].astype(np.float64),
+                    "means": z["means"].astype(np.float64),
+                    "weights": z["weights"].astype(np.float64),
+                }
+                if "sky_mask" in z:
+                    data["sky_mask"] = z["sky_mask"].astype(bool)
+                self._cache[image_id] = data
+        return self._cache[image_id]
+
+    def get_depth(self, image_id: int, u: float, v: float) -> Optional[DepthSample]:
+        data = self._load(image_id)
+        if data is None:
+            return None
+        h, w = data["decoded"].shape[:2]
+        col = int(np.clip(round(u), 0, w - 1))
+        row = int(np.clip(round(v), 0, h - 1))
+        if "sky_mask" in data and data["sky_mask"][row, col]:
+            return None
+        d_dec = float(data["decoded"][row, col])
+        if not np.isfinite(d_dec) or d_dec <= 0.0:
+            return None
+        if not self._multimodal:
+            return DepthSample(depth=d_dec, depth_alt=None, ambiguous=False, score=0.0)
+        mu = data["means"][:, row, col]
+        wts = data["weights"][:, row, col]
+        valid = np.isfinite(mu) & (mu > 0.0)
+        if not valid.any():
+            return None
+        mu, wts = mu[valid], wts[valid]
+        order = np.argsort(mu)  # near -> far
+        mu, wts = mu[order], wts[order]
+        wts = np.maximum(wts, 1e-4)
+        wts = wts / wts.sum()
+        return DepthSample(
+            depth=d_dec,  # decoded value (auto_scale fit + alpha_i warm start); NOT a mixture mode
+            depth_alt=float(mu[1]) if len(mu) > 1 else None,
+            ambiguous=len(mu) > 1,
+            score=float(np.log(mu[-1]) - np.log(mu[0])) if len(mu) > 1 else 0.0,
+            depths=tuple(float(x) for x in mu),
+            sigmas=(),  # shared log-space sigma supplied by BA (depth_factor_sigma_log)
+            log_weights=tuple(float(x) for x in np.log(wts)),  # diagnostics only; selection is uniform
+            is_mixture=True,
+        )
+
+
 class MdaDepthProvider:
     """Depth source from precomputed MDA mixtures, aligned to in-memory VGGT depth.
 
