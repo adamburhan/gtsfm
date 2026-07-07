@@ -168,6 +168,21 @@ def evaluate_points(points: np.ndarray, gt_points: np.ndarray, taus: list[float]
     return metrics
 
 
+def crop_to_tnt_volume(points: np.ndarray, align_ref) -> np.ndarray:
+    """Official T&T protocol: crop recon points to the scene's bounding polyhedron (GT-frame *.json).
+
+    Points outside the scanned volume (through windows, down corridors) otherwise get billed the
+    nearest-neighbor distance to a GT scan that never covered them.
+    """
+    import open3d as o3d
+
+    vol = o3d.visualization.read_selection_polygon_volume(str(next(Path(align_ref).glob("*.json"))))
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.asarray(points)))
+    cropped = np.asarray(vol.crop_point_cloud(pcd).points)
+    print(f"tnt crop volume: kept {len(cropped)}/{len(points)} points")
+    return cropped
+
+
 def build_to_world(align_mode: str, align_ref, wTi_list, img_fnames):
     """Map recon points into the GT/world frame. Returns (to_world, alignment).
 
@@ -209,6 +224,8 @@ def main() -> None:
     wTi_list, img_fnames, _, points, _, _ = io_utils.read_scene_data_from_colmap_format(args.sfm_output)
     to_world, alignment = build_to_world(args.align_mode, args.align_ref, wTi_list, img_fnames)
     points = np.array([to_world(p) for p in points])
+    if args.align_mode == "tnt":
+        points = crop_to_tnt_volume(points, args.align_ref)
 
     gt_points, gt_dist = build_gt(args.gt_ply)  # point-to-surface accuracy for a mesh PLY
     metrics = evaluate_points(points, gt_points, args.tau, gt_dist)
