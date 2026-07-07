@@ -48,6 +48,22 @@ def _gt_poses_from_colmap(align_ref: str, img_fnames) -> dict[int, gtsam.Pose3]:
     return {i: by_name[Path(f).name] for i, f in enumerate(img_fnames) if Path(f).name in by_name}
 
 
+def _gt_poses_from_log(align_ref: str, img_fnames) -> dict[int, gtsam.Pose3]:
+    """T&T scene dir -> {recon_idx: GT cam-to-world} from *_COLMAP_SfM.log (1-based image filenames)."""
+    from gtsfm.loader.tanks_and_temples_loader import _parse_redwood_data_log_file
+
+    log_poses = _parse_redwood_data_log_file(str(next(Path(align_ref).glob("*_COLMAP_SfM.log"))))
+    poses = {}
+    for i, fname in enumerate(img_fnames):
+        match = re.search(r"(\d+)$", Path(fname).stem)
+        if match is not None and int(match.group(1)) - 1 in log_poses:
+            poses[i] = log_poses[int(match.group(1)) - 1]
+    return poses
+
+
+_GT_POSE_LOADERS = {"replica": _gt_poses_from_traj, "eth3d": _gt_poses_from_colmap, "tnt": _gt_poses_from_log}
+
+
 def sim3_align(wTi_list, gt_poses: dict[int, gtsam.Pose3]) -> tuple[gtsam.Similarity3, float]:
     """Robust Sim(3) from estimated cameras to GT poses; returns (wSr, camera-center RMS_m).
 
@@ -71,12 +87,11 @@ def compute_pose_metrics(wTi_list, img_fnames, align_mode: str, align_ref) -> di
     offline over existing `ba_output` dirs with no re-reconstruction. Emits the same keys and JSON shape
     as `bundle_adjustment_metrics.json` (pose_auc_@X_deg scalars; rotation_angle_error_deg /
     translation_error_distance as {"summary": {...}} distributions), so the sweep aggregator reads them
-    identically. Returns None when GT poses are unavailable (align_mode "none"/"tnt") or too few match.
+    identically. Returns None when GT poses are unavailable (align_mode "none") or too few match.
     """
-    if align_mode not in ("replica", "eth3d"):
+    if align_mode == "none":
         return None
-    load_poses = _gt_poses_from_traj if align_mode == "replica" else _gt_poses_from_colmap
-    gt_poses = load_poses(align_ref, img_fnames)
+    gt_poses = _GT_POSE_LOADERS[align_mode](align_ref, img_fnames)
     matched = {i: wTi_list[i] for i in gt_poses if i < len(wTi_list) and wTi_list[i] is not None}
     if len(matched) < 3:
         return None
@@ -156,19 +171,20 @@ def evaluate_points(points: np.ndarray, gt_points: np.ndarray, taus: list[float]
 def build_to_world(align_mode: str, align_ref, wTi_list, img_fnames):
     """Map recon points into the GT/world frame. Returns (to_world, alignment).
 
-    `alignment` is `{"sim3_scale", "camera_rms_m"}` for the pose modes (replica/eth3d) — byproducts of
-    the recon->GT Sim(3) fit, surfaced for the metrics JSON — and None for none/tnt (no Sim(3) fit).
+    All pose modes Sim(3)-fit the recon cameras to GT poses; `alignment` surfaces the fit's
+    `{"sim3_scale", "camera_rms_m"}` for the metrics JSON (None for align_mode "none"). For tnt the
+    fit lands in the COLMAP GT frame, then *_trans.txt maps COLMAP -> LiDAR (GT ply) frame.
     """
     if align_mode == "none":
         return (lambda p: np.asarray(p, dtype=float)), None
-    if align_mode == "tnt":
-        T = np.loadtxt(align_ref).reshape(4, 4)
-        R, t = T[:3, :3], T[:3, 3]
-        return (lambda p: np.asarray(p, dtype=float) @ R.T + t), None
-    load_poses = _gt_poses_from_traj if align_mode == "replica" else _gt_poses_from_colmap
-    wSr, rms_m = sim3_align(wTi_list, load_poses(align_ref, img_fnames))
+    wSr, rms_m = sim3_align(wTi_list, _GT_POSE_LOADERS[align_mode](align_ref, img_fnames))
     print(f"recon->world Sim(3): scale={wSr.scale():.6f}, camera-center RMS={rms_m:.4f} m")
     to_world = lambda p: np.array(wSr.transformFrom(np.asarray(p, dtype=float)))
+    if align_mode == "tnt":
+        T = np.loadtxt(next(Path(align_ref).glob("*_trans.txt"))).reshape(4, 4)
+        R, t = T[:3, :3], T[:3, 3]
+        colmap_to_world = to_world
+        to_world = lambda p: colmap_to_world(p) @ R.T + t
     return to_world, {"sim3_scale": float(wSr.scale()), "camera_rms_m": float(rms_m)}
 
 
@@ -180,7 +196,8 @@ def main() -> None:
     parser.add_argument(
         "--align_ref",
         default=None,
-        help="Alignment reference: traj.txt (replica), COLMAP GT dir (eth3d), or 4x4 *_trans.txt (tnt).",
+        help="Alignment reference: traj.txt (replica), COLMAP GT dir (eth3d), or scene dir with "
+        "*_COLMAP_SfM.log + *_trans.txt (tnt).",
     )
     parser.add_argument("--tau", type=float, nargs="+", default=[0.025, 0.05], help="Distance thresholds in meters.")
     parser.add_argument("--out", default=None, help="Output JSON path (default: <sfm_output>/../geometry_metrics.json).")
